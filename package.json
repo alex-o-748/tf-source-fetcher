@@ -1,0 +1,36 @@
+{
+  "name": "source-fetcher",
+  "version": "1.0.0",
+  "description": "Toolforge webservice that fetches a cited web page or PDF and extracts readable text from it, for the citation-checker-script userscript and its batch job.",
+  "main": "server.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/e2e.test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alex-o-748/tf-source-fetcher.git"
+  },
+  "keywords": [
+    "wikipedia",
+    "citation",
+    "toolforge"
+  ],
+  "author": "",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/alex-o-748/tf-source-fetcher/issues"
+  },
+  "homepage": "https://github.com/alex-o-748/tf-source-fetcher#readme",
+  "dependencies": {
+    "@mozilla/readability": "^0.6.0",
+    "ioredis": "^6.0.0",
+    "jsdom": "^30.0.1",
+    "robots-parser": "^3.0.1",
+    "unpdf": "^1.8.0"
+  }
+}
