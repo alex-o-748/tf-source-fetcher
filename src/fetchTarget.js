@@ -109,6 +109,9 @@ async function fetchAndExtract(targetUrl, pageParam) {
     return {
       ...emptyResultBase(response.status, fetchedAt),
       error: `Source returned HTTP ${response.status}`,
+      // Passed up so a host that tells us how long to wait is obeyed, rather
+      // than backed off for our fixed default and then hit again too early.
+      retryAfter: response.headers.get('retry-after'),
     };
   }
 

@@ -89,6 +89,10 @@ module.exports = {
   disconnect,
   get,
   set,
+  // Exposed so in-process request coalescing can key on exactly the same
+  // identity the cache does — otherwise two requests could be "the same URL"
+  // to Redis but distinct to the coalescer, and duplicate the upstream fetch.
+  keyFor: normalizeKey,
   isReady: () => ready,
   CACHE_TTL_OK_SECONDS,
   CACHE_TTL_ERROR_SECONDS,
