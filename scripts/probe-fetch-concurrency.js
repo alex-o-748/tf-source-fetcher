@@ -46,6 +46,7 @@ const { values } = parseArgs({
     'urls-per-host': { type: 'string', default: '6' },
     requests: { type: 'string', default: '240' },
     levels: { type: 'string', default: '1,4,16,64,256' },
+    skew: { type: 'string', default: '0' },
     help: { type: 'boolean', short: 'h', default: false },
   },
   strict: true,
@@ -64,6 +65,11 @@ Options:
   --urls-per-host <n>  Distinct target URLs per host (default 6)
   --requests <n>       Requests fired at each concurrency level (default 240)
   --levels <list>      Comma-separated caller concurrency levels (default 1,4,16,64,256)
+  --skew <pct>         Send this % of requests to ONE host, modelling a corpus
+                       where a single hostname (web.archive.org) carries a
+                       large share of citations. Reports that host's outcomes
+                       separately from the long tail. Try --skew 24, the real
+                       share measured in benchmark/dataset.json. (default 0)
   --help, -h           Show this help and exit.
 `);
   process.exit(0);
@@ -73,6 +79,7 @@ const NUM_HOSTS = Number(values.hosts);
 const URLS_PER_HOST = Number(values['urls-per-host']);
 const REQUESTS_PER_LEVEL = Number(values.requests);
 const LEVELS = values.levels.split(',').map(Number);
+const SKEW_PCT = Number(values.skew);
 
 if (process.env.REDIS_URL === undefined) process.env.DISABLE_CACHE = '1';
 process.env.PORT = process.env.PORT || '0';
@@ -125,9 +132,40 @@ function buildTargetPool(fixtures) {
   return targets;
 }
 
-async function runLevel(concurrency, totalRequests, targets, baseUrl, levelNonce) {
+// Per-host limiting is a good model of "one publisher's tolerance" only while
+// hosts are roughly interchangeable. A corpus where one hostname carries a
+// large share of citations breaks that assumption: that host's requests all
+// compete for a single slot while the long tail runs fully parallel, so the
+// concentrated host starves on our *own* refusals while everything else
+// sails through. Real Wikipedia corpora look exactly like this because of
+// web.archive.org, so the probe has to be able to produce that shape.
+function buildSkewedPool(targets, hotHostBase) {
+  if (!SKEW_PCT) return { pool: targets, isHot: () => false };
+  const hot = targets.filter((t) => t.startsWith(hotHostBase));
+  const cold = targets.filter((t) => !t.startsWith(hotHostBase));
+  return {
+    pool: targets,
+    hotBase: hotHostBase,
+    isHot: (url) => url.startsWith(hotHostBase),
+    hot,
+    cold,
+  };
+}
+
+async function runLevel(concurrency, totalRequests, targets, baseUrl, levelNonce, skew) {
   let nextIdx = 0;
   const results = new Array(totalRequests);
+
+  // With --skew, pick the target by share rather than round-robin, so the hot
+  // host really does receive SKEW_PCT of the load.
+  function pickTarget(i) {
+    if (!skew || !skew.hotBase || skew.hot.length === 0 || skew.cold.length === 0) {
+      return targets[i % targets.length];
+    }
+    return i % 100 < SKEW_PCT
+      ? skew.hot[i % skew.hot.length]
+      : skew.cold[i % skew.cold.length];
+  }
 
   async function worker() {
     for (;;) {
@@ -137,20 +175,22 @@ async function runLevel(concurrency, totalRequests, targets, baseUrl, levelNonce
       // is correct whether or not the target already has a query string
       // (naive `+ '&lv=' + n` mangles a bare-path target like /ratelimited
       // into an unrecognized path, which is a bug this probe hit once).
-      const targetUrl = new URL(targets[i % targets.length]);
+      const targetUrl = new URL(pickTarget(i));
       targetUrl.searchParams.set('lv', String(levelNonce));
       const target = targetUrl.toString();
+      const hot = skew ? skew.isHot(targetUrl.origin + '/') : false;
       const start = Date.now();
       try {
         const u = new URL('/', baseUrl);
         u.searchParams.set('fetch', target);
         const res = await fetch(u);
         const body = await res.json();
-        results[i] = { ms: Date.now() - start, httpStatus: res.status, body };
+        results[i] = { ms: Date.now() - start, httpStatus: res.status, body, hot };
       } catch (e) {
         results[i] = {
           ms: Date.now() - start,
           httpStatus: 0,
+          hot,
           body: { status: null, error: String(e), refused_by: null, coalesced: false },
         };
       }
@@ -206,6 +246,14 @@ async function main() {
 
   const fixtures = await startFixtures(NUM_HOSTS);
   const targets = buildTargetPool(fixtures);
+  // The first fixture stands in for the one concentrated host.
+  const skew = SKEW_PCT ? buildSkewedPool(targets, `${fixtures[0].base}/`) : null;
+  if (skew) {
+    console.log(
+      `Skew: ${SKEW_PCT}% of requests directed at a single host ` +
+        `(${fixtures[0].base}), the rest spread across the other ${NUM_HOSTS - 1}.`
+    );
+  }
 
   const sourceFetcherServer = require('../server');
   const baseUrl = await new Promise((resolve) => {
@@ -230,7 +278,14 @@ async function main() {
   for (const level of LEVELS) {
     for (const fixture of fixtures) fixture.reset();
 
-    const { wallMs, results } = await runLevel(level, REQUESTS_PER_LEVEL, targets, baseUrl, level);
+    const { wallMs, results } = await runLevel(
+      level,
+      REQUESTS_PER_LEVEL,
+      targets,
+      baseUrl,
+      level,
+      skew
+    );
     const summary = summarize(results);
 
     const perHostPeak = Math.max(...fixtures.map((f) => f.stats.maxInFlight));
@@ -246,6 +301,32 @@ async function main() {
     console.log(`  status:     ${fmtCounts(summary.statusCounts)}`);
     console.log(`  refused_by: ${fmtCounts(summary.refusedByCounts)}`);
     console.log(`  coalesced:  ${summary.coalesced}`);
+
+    if (skew) {
+      const split = (hot) => {
+        const s = results.filter((r) => r.hot === hot);
+        const starved = s.filter((r) => r.body.refused_by === 'rate-limiter').length;
+        const ok = s.filter((r) => r.body.status === 200).length;
+        const pct = s.length ? Math.round((100 * starved) / s.length) : 0;
+        return { n: s.length, ok, starved, pct };
+      };
+      const hot = split(true);
+      const tail = split(false);
+      console.log(
+        `  concentrated host: ${hot.n} reqs, ${hot.ok} ok, ` +
+          `${hot.starved} refused by us (${hot.pct}% starved)`
+      );
+      console.log(
+        `  long tail:         ${tail.n} reqs, ${tail.ok} ok, ` +
+          `${tail.starved} refused by us (${tail.pct}% starved)`
+      );
+      if (hot.pct - tail.pct >= 25) {
+        console.log(
+          `  ^^ the concentrated host is being starved relative to the tail: ` +
+            `per-host limiting is penalising it for being popular, not for misbehaving.`
+        );
+      }
+    }
     console.log(
       `  per-host peak seen by publishers: ${perHostPeak} (cap ${config.HOST_MAX_CONCURRENCY}) ` +
         `${hostCapHeld ? 'OK' : '*** VIOLATED ***'}`
