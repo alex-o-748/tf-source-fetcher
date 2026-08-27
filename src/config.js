@@ -16,6 +16,34 @@ function numEnv(name, fallback) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+const DEFAULT_HOST_OVERRIDES = {
+  // maxQueueWaitMs/maxQueueDepth are raised too, not just maxConcurrency/
+  // minIntervalMs: minIntervalMs paces admission out of the queue at one per
+  // interval regardless of maxConcurrency (see the comment on
+  // HostRateLimiter._limitsFor in src/rateLimiter.js), so a host seeing an
+  // outsized share of traffic still gets refused by the queue-wait budget
+  // almost as readily even with a wider concurrency door. A host known in
+  // advance to carry that kind of share should be given more patience to
+  // queue rather than shed early — shedding it doesn't reduce real demand,
+  // it just turns into the caller retrying the same request later.
+  'web.archive.org': {
+    maxConcurrency: 2,
+    minIntervalMs: 500,
+    maxQueueWaitMs: 30000,
+    maxQueueDepth: 256,
+  },
+};
+
+function hostOverrides() {
+  const raw = process.env.HOST_OVERRIDES_JSON;
+  if (!raw) return DEFAULT_HOST_OVERRIDES;
+  try {
+    return { ...DEFAULT_HOST_OVERRIDES, ...JSON.parse(raw) };
+  } catch {
+    return DEFAULT_HOST_OVERRIDES;
+  }
+}
+
 module.exports = {
   PORT: process.env.PORT || 8080,
 
@@ -68,6 +96,27 @@ module.exports = {
   HOST_BACKOFF_MS: numEnv('HOST_BACKOFF_MS', 30000),
   HOST_BACKOFF_MAX_MS: numEnv('HOST_BACKOFF_MAX_MS', 10 * 60 * 1000),
 
+  // Known hosts whose fetch tolerance differs from the generic per-host
+  // default above, keyed by hostname. This is structural knowledge about a
+  // specific publisher rather than a deployment tunable, so it lives in code
+  // — but HOST_OVERRIDES_JSON lets an operator override or add entries
+  // without a code change if a host's real limits turn out to differ.
+  //
+  // web.archive.org gets a dedicated entry because nearly every dead-link
+  // fallback, and every citation that already carries an archive link,
+  // funnels through this one hostname: in the maintainer's own benchmark
+  // dataset it is 24% of all source URLs and the single most-requested host
+  // by 7.6x (see scripts/probe-fetch-concurrency.js --skew). Treated like any
+  // other single host under the generic HOST_MAX_CONCURRENCY (default 1),
+  // that means a quarter of all traffic queues behind one slot while
+  // everything else runs in parallel — self-inflicted starvation of exactly
+  // the citations that already needed archiving because the original died.
+  // These numbers are a conservative starting point, not a verified ceiling
+  // — confirm them against archive.org's current published limits (and that
+  // its robots.txt actually allows `/web/`) before raising them or relying
+  // on this in production.
+  HOST_OVERRIDES: hostOverrides(),
+
   // Process-wide ceiling on simultaneous upstream fetches, across all hosts.
   // This is the number that bounds how much outbound traffic Wikimedia IP
   // space emits on our behalf at any instant, so it is deliberately well
@@ -83,6 +132,12 @@ module.exports = {
   CACHE_KEY_PREFIX: 'source-fetcher:',
   CACHE_TTL_OK_SECONDS: numEnv('CACHE_TTL_OK_SECONDS', 24 * 60 * 60),
   CACHE_TTL_ERROR_SECONDS: numEnv('CACHE_TTL_ERROR_SECONDS', 60 * 60),
+  // A pinned Wayback Machine snapshot (src/archiveSnapshot.js) cannot change
+  // — Wayback doesn't edit or delete a capture in place — so it earns a TTL
+  // far beyond CACHE_TTL_OK_SECONDS's "fact about the world right now"
+  // assumption. 30 days, not literally forever, only so a permanently wrong
+  // cache entry (a bug, a misclassified URL) ages out on its own eventually.
+  CACHE_TTL_IMMUTABLE_SECONDS: numEnv('CACHE_TTL_IMMUTABLE_SECONDS', 30 * 24 * 60 * 60),
   // Disable caching entirely (e.g. for local dev without Redis) by setting
   // DISABLE_CACHE=1.
   CACHE_DISABLED: process.env.DISABLE_CACHE === '1',

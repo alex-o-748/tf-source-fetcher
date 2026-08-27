@@ -27,12 +27,22 @@ function parseRetryAfter(headerValue) {
 // Per-host politeness control, and the point where concurrency against a
 // single publisher is actually bounded.
 //
-// Three constraints, all per host:
+// Three constraints, per host:
 //   * at most `maxConcurrency` requests in flight at once — a slot is held
 //     for the whole request, so a slow host applies backpressure by itself
 //     rather than us firing at a fixed rate into a queue it can't drain;
 //   * at least `minIntervalMs` between two request *starts*;
 //   * a cooldown after the host has told us to slow down (429).
+//
+// `maxConcurrency` and `minIntervalMs` are the generic defaults; a specific
+// host can get its own values via `overrides` (hostname -> partial
+// {maxConcurrency, minIntervalMs}), which defaults to config.HOST_OVERRIDES.
+// This exists because "one hostname" and "one publisher's tolerance" is only
+// a good match for the long tail — a host that concentrates an unusual share
+// of all traffic (web.archive.org, in this project's case: every dead-link
+// fallback funnels through it) needs its own budget, or it gets starved by
+// our *own* refusals in exact proportion to how popular it is, which is
+// backwards.
 //
 // Callers that can't be admitted within `maxQueueWaitMs` are refused with a
 // RateLimitedError rather than queued forever, so a caller running at high
@@ -50,15 +60,40 @@ class HostRateLimiter {
     this.maxQueueDepth = Math.max(0, options.maxQueueDepth ?? config.HOST_MAX_QUEUE_DEPTH);
     this.backoffMs = Math.max(0, options.backoffMs ?? config.HOST_BACKOFF_MS);
     this.backoffMaxMs = Math.max(0, options.backoffMaxMs ?? config.HOST_BACKOFF_MAX_MS);
+    this.overrides = options.overrides ?? config.HOST_OVERRIDES ?? {};
 
     this.hosts = new Map(); // host -> state
     this.refusedTotal = 0;
     this.backoffTotal = 0;
   }
 
+  // Resolves the effective per-host limits once, at first use, so that
+  // changing this.overrides later (nothing does today, but nothing should
+  // have to know that) can't retroactively change a host already in flight.
+  //
+  // Includes maxQueueWaitMs/maxQueueDepth, not just maxConcurrency/
+  // minIntervalMs: minIntervalMs paces admissions *out of* the queue at one
+  // per interval no matter how high maxConcurrency is (by design — it
+  // prevents a backlog of queued waiters from bursting all at once when a
+  // slot frees up), so raising maxConcurrency alone barely helps a host that
+  // is seeing a disproportionate share of traffic relative to everyone
+  // else — it still gets refused by our own queue-wait budget just as
+  // readily. A host known to carry that kind of share should be given more
+  // patience to queue, not just a wider door.
+  _limitsFor(host) {
+    const override = this.overrides[host];
+    return {
+      maxConcurrency: Math.max(1, override?.maxConcurrency ?? this.maxConcurrency),
+      minIntervalMs: Math.max(0, override?.minIntervalMs ?? this.minIntervalMs),
+      maxQueueWaitMs: Math.max(0, override?.maxQueueWaitMs ?? this.maxQueueWaitMs),
+      maxQueueDepth: Math.max(0, override?.maxQueueDepth ?? this.maxQueueDepth),
+    };
+  }
+
   _state(host) {
     let state = this.hosts.get(host);
     if (!state) {
+      const { maxConcurrency, minIntervalMs, maxQueueWaitMs, maxQueueDepth } = this._limitsFor(host);
       state = {
         active: 0,
         nextStartAt: 0,
@@ -66,6 +101,10 @@ class HostRateLimiter {
         queue: [],
         timer: null,
         evictTimer: null,
+        maxConcurrency,
+        minIntervalMs,
+        maxQueueWaitMs,
+        maxQueueDepth,
       };
       this.hosts.set(host, state);
     }
@@ -91,7 +130,7 @@ class HostRateLimiter {
       state.timer = null;
     }
 
-    while (state.queue.length > 0 && state.active < this.maxConcurrency) {
+    while (state.queue.length > 0 && state.active < state.maxConcurrency) {
       const now = Date.now();
       if (state.nextStartAt > now) {
         state.timer = setTimeout(() => {
@@ -102,7 +141,7 @@ class HostRateLimiter {
       }
       const waiter = state.queue.shift();
       state.active += 1;
-      state.nextStartAt = now + this.minIntervalMs;
+      state.nextStartAt = now + state.minIntervalMs;
       waiter.admit();
     }
 
@@ -164,9 +203,9 @@ class HostRateLimiter {
     }
 
     // Fast path: nobody ahead of us, a slot free, and the pacing gap elapsed.
-    if (state.queue.length === 0 && state.active < this.maxConcurrency && state.nextStartAt <= now) {
+    if (state.queue.length === 0 && state.active < state.maxConcurrency && state.nextStartAt <= now) {
       state.active += 1;
-      state.nextStartAt = now + this.minIntervalMs;
+      state.nextStartAt = now + state.minIntervalMs;
       return this._releaseFn(host, state);
     }
 
@@ -175,12 +214,12 @@ class HostRateLimiter {
     // deliberately ignores how long currently-active requests will run — the
     // hard timeout below is what actually guarantees the bound.
     const estimatedWaitMs =
-      Math.max(0, state.nextStartAt - now) + state.queue.length * this.minIntervalMs;
-    if (estimatedWaitMs > this.maxQueueWaitMs || state.queue.length >= this.maxQueueDepth) {
+      Math.max(0, state.nextStartAt - now) + state.queue.length * state.minIntervalMs;
+    if (estimatedWaitMs > state.maxQueueWaitMs || state.queue.length >= state.maxQueueDepth) {
       this.refusedTotal += 1;
       throw new RateLimitedError(
         `Too many concurrent requests queued for ${host}; try again shortly`,
-        estimatedWaitMs || this.minIntervalMs
+        estimatedWaitMs || state.minIntervalMs
       );
     }
 
@@ -194,12 +233,12 @@ class HostRateLimiter {
         this._maybeEvict(host, state);
         reject(
           new RateLimitedError(
-            `Waited ${this.maxQueueWaitMs}ms for a slot on ${host} without getting one; ` +
+            `Waited ${state.maxQueueWaitMs}ms for a slot on ${host} without getting one; ` +
               'try again shortly',
-            this.minIntervalMs
+            state.minIntervalMs
           )
         );
-      }, this.maxQueueWaitMs);
+      }, state.maxQueueWaitMs);
 
       waiter.admit = () => {
         clearTimeout(waiter.timer);
@@ -238,6 +277,7 @@ class HostRateLimiter {
       hosts_backing_off: backingOff,
       refused_total: this.refusedTotal,
       backoff_total: this.backoffTotal,
+      overrides: this.overrides,
     };
   }
 }

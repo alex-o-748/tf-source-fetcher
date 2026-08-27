@@ -9,6 +9,7 @@ const { HostRateLimiter, RateLimitedError } = require('./src/rateLimiter');
 const { Semaphore, CapacityError } = require('./src/semaphore');
 const { SingleFlight } = require('./src/singleFlight');
 const { fetchAndExtract } = require('./src/fetchTarget');
+const { cacheTtlSecondsFor } = require('./src/cachePolicy');
 
 const hostLimiter = new HostRateLimiter();
 const capacity = new Semaphore(config.MAX_CONCURRENT_FETCHES, config.CAPACITY_MAX_QUEUE_WAIT_MS);
@@ -79,10 +80,6 @@ function outerStatusFor(jsonStatus) {
   return jsonStatus === null || jsonStatus === undefined ? 502 : jsonStatus;
 }
 
-function isSuccessStatus(status) {
-  return typeof status === 'number' && status >= 200 && status < 300;
-}
-
 function hostOf(targetUrl) {
   try {
     return new URL(targetUrl).host;
@@ -93,20 +90,6 @@ function hostOf(targetUrl) {
 
 function retryAfterSeconds(ms) {
   return Math.max(1, Math.ceil((ms || 0) / 1000));
-}
-
-// A 429 is the one upstream status whose useful lifetime is stated by the
-// response itself. Caching it for the generic error TTL would keep serving
-// "slow down" for an hour after the publisher's window reopened, and would
-// contradict the `retry_after` sitting in the same body; so it is cached for
-// exactly as long as we're telling the caller to wait, and no longer.
-function cacheTtlFor(body) {
-  if (isSuccessStatus(body.status)) return cache.CACHE_TTL_OK_SECONDS;
-  if (body.status === 429) {
-    const asked = body.retry_after || cache.CACHE_TTL_ERROR_SECONDS;
-    return Math.min(asked, cache.CACHE_TTL_ERROR_SECONDS);
-  }
-  return cache.CACHE_TTL_ERROR_SECONDS;
 }
 
 // Does the actual work for one uncached (url, page) pair, and returns
@@ -229,7 +212,7 @@ async function performFetch(targetUrl, pageParamRaw, cacheKeyPage, cacheable) {
     });
 
     if (cacheable) {
-      await cache.set(targetUrl, cacheKeyPage, body, cacheTtlFor(body));
+      await cache.set(targetUrl, cacheKeyPage, body, cacheTtlSecondsFor(targetUrl, body));
     }
 
     return { httpStatus: outerStatusFor(result.status), body };

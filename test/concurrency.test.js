@@ -228,6 +228,130 @@ test('idle host state is evicted so a long sweep does not leak', async () => {
   assert.equal(rl.snapshot().hosts_tracked, 0);
 });
 
+test('a per-host override changes limits for that host only', async () => {
+  const rl = limiter({
+    maxConcurrency: 1,
+    minIntervalMs: 500,
+    maxQueueWaitMs: 5000,
+    overrides: { 'web.archive.org': { maxConcurrency: 3, minIntervalMs: 0 } },
+  });
+
+  let active = 0;
+  let peak = 0;
+  await Promise.all(
+    Array.from({ length: 6 }, async () => {
+      const release = await rl.acquire('web.archive.org');
+      active += 1;
+      if (active > peak) peak = active;
+      await sleep(15);
+      active -= 1;
+      release();
+    })
+  );
+  assert.equal(peak, 3, 'the overridden host should allow its own maxConcurrency, not the default 1');
+
+  // A plain host must still see the generic default (maxConcurrency 1),
+  // unaffected by the override entry that exists for a different hostname.
+  active = 0;
+  peak = 0;
+  await Promise.all(
+    Array.from({ length: 4 }, async () => {
+      const release = await rl.acquire('ordinary.example');
+      active += 1;
+      if (active > peak) peak = active;
+      await sleep(15);
+      active -= 1;
+      release();
+    })
+  );
+  assert.equal(peak, 1, 'a host with no override must keep the generic default');
+});
+
+test('a per-host override with a shorter interval is honoured', async () => {
+  const rl = limiter({
+    maxConcurrency: 4,
+    minIntervalMs: 500,
+    maxQueueWaitMs: 5000,
+    overrides: { 'fast.example': { minIntervalMs: 10 } },
+  });
+
+  const started = Date.now();
+  for (let i = 0; i < 4; i++) {
+    (await rl.acquire('fast.example'))();
+  }
+  assert.ok(Date.now() - started < 200, 'the overridden interval should apply, not the 500ms default');
+});
+
+test('an override with a bigger queue budget rescues a host from being shed under a burst', async () => {
+  // minIntervalMs paces admission out of the queue at one per interval no
+  // matter how high maxConcurrency is, so a host absorbing a disproportionate
+  // burst is still gated by its queue-wait budget almost as readily as
+  // before, even with a wider concurrency door. This is the case that
+  // motivated extending overrides to maxQueueWaitMs, not just
+  // maxConcurrency/minIntervalMs.
+  async function fireBurst(rl, n, holdMs) {
+    let refused = 0;
+    await Promise.all(
+      Array.from({ length: n }, async () => {
+        try {
+          const release = await rl.acquire('hot');
+          await sleep(holdMs);
+          release();
+        } catch (e) {
+          if (!(e instanceof RateLimitedError)) throw e;
+          refused += 1;
+        }
+      })
+    );
+    return refused;
+  }
+
+  // 10 requests draining one at a time, 100ms apart, take ~1000ms in total —
+  // comfortably past a 250ms queue-wait budget for everyone queued behind
+  // the first couple, but well inside a 5000ms one.
+  const impatient = limiter({
+    maxConcurrency: 1,
+    minIntervalMs: 100,
+    maxQueueWaitMs: 250,
+    overrides: { hot: { maxConcurrency: 1, minIntervalMs: 100, maxQueueWaitMs: 250 } },
+  });
+  const refusedImpatient = await fireBurst(impatient, 10, 20);
+  assert.ok(refusedImpatient > 0, 'a short queue-wait budget should shed part of this burst');
+
+  const patient = limiter({
+    maxConcurrency: 1,
+    minIntervalMs: 100,
+    maxQueueWaitMs: 250,
+    overrides: { hot: { maxConcurrency: 1, minIntervalMs: 100, maxQueueWaitMs: 5000 } },
+  });
+  const refusedPatient = await fireBurst(patient, 10, 20);
+  assert.equal(refusedPatient, 0, 'a longer queue-wait budget should let the same burst through instead of shedding it');
+});
+
+test('a plain host is unaffected by another host\'s queue-budget override', async () => {
+  const rl = limiter({
+    maxConcurrency: 1,
+    minIntervalMs: 500,
+    maxQueueWaitMs: 100,
+    overrides: { 'web.archive.org': { maxQueueWaitMs: 60000 } },
+  });
+  const held = await rl.acquire('ordinary.example');
+  await assert.rejects(() => rl.acquire('ordinary.example'), RateLimitedError);
+  held();
+});
+
+test('config.HOST_OVERRIDES ships a conservative web.archive.org entry by default', () => {
+  const config = require('../src/config');
+  const override = config.HOST_OVERRIDES['web.archive.org'];
+  assert.ok(override, 'web.archive.org must have a dedicated override — it dominates real citation traffic');
+  assert.ok(override.maxConcurrency >= 1);
+  assert.ok(override.minIntervalMs >= 0);
+  assert.ok(
+    override.maxQueueWaitMs > config.HOST_MAX_QUEUE_WAIT_MS,
+    'a host known to carry an outsized share of traffic needs more queueing patience than the generic default, not just a wider concurrency door'
+  );
+});
+
 test('semaphore caps global concurrency and sheds when saturated', async () => {
   const sem = new Semaphore(3, 80);
   let active = 0;

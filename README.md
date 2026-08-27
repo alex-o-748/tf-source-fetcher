@@ -238,6 +238,37 @@ throughput knob — and the parent project's design notes are explicit that
 concentrating editors' fetches onto Wikimedia IP space is a reputational
 exposure for the Foundation, not just a technical one.
 
+### One host isn't always one publisher
+
+Per-host limiting assumes "one hostname" and "one publisher's tolerance" are
+roughly the same thing. That holds for the long tail of news sites; it
+doesn't hold for **`web.archive.org`**, which nearly every dead-link fallback
+and every citation that already carries an archive link funnels through (see
+[Out of scope](#out-of-scope) below). In the maintainer's own benchmark
+dataset it's 24% of all source URLs and the single most-requested host by
+7.6x — measured with `scripts/probe-fetch-concurrency.js --skew 24`, which
+reproduces exactly this shape locally.
+
+Left under the generic default, that means a quarter of all traffic queues
+behind one `HOST_MAX_CONCURRENCY: 1` slot while everything else runs 16-wide
+in parallel — the concentrated host gets refused by *our own* rate limiter
+in proportion to how popular it is, which starves precisely the citations
+that already needed archiving because the original died. `--skew` in the
+probe shows this directly: at realistic skew, the concentrated host sees far
+more `refused_by: "rate-limiter"` than the long tail at the same caller
+concurrency.
+
+`HOST_OVERRIDES` in `src/config.js` fixes this generically: a hostname ->
+`{maxConcurrency, minIntervalMs}` table, checked before the generic default
+whenever a new host is first seen. It ships one entry, `web.archive.org` at
+`{maxConcurrency: 2, minIntervalMs: 500}` — a conservative starting point,
+not a verified ceiling. Confirm it against archive.org's current published
+limits (and that its `robots.txt` actually allows `/web/`, which this
+service will otherwise honor and block on) before relying on it in
+production. Override or add entries at runtime with `HOST_OVERRIDES_JSON`
+(a JSON object merged over the defaults) if a host's real tolerance turns
+out to differ.
+
 ### Sizing a real run
 
 `GET /stats` reports the live picture — in-flight and queued host slots,
@@ -276,6 +307,17 @@ for benchmark comparisons.
   Caching it for the full hour would keep serving "slow down" long after the
   publisher's window reopened, and would contradict the retry hint sitting
   next to it.
+- A **pinned Wayback Machine snapshot** — a fully-timestamped
+  `web.archive.org/web/<14-digit timestamp>[id_]/<url>` — is the opposite
+  exception: its content cannot change (Wayback doesn't edit or delete a
+  capture in place), so a successful fetch of one caches for
+  `CACHE_TTL_IMMUTABLE_SECONDS` (30 days by default) instead of the ordinary
+  24h. `src/archiveSnapshot.js` does the recognizing; it deliberately treats
+  an *ambiguous* Wayback URL (`/web/2025/<url>`, "closest capture to some
+  date", not a specific one) as ordinary content rather than risk caching a
+  moving target as if it were fixed. A failed fetch to a snapshot URL still
+  uses the normal error TTL — a transient Wayback outage isn't a permanent
+  fact worth remembering for 30 days.
 - Unreachable-host results (`status: null`) and our own refusals
   (`refused_by: "rate-limiter"` / `"capacity"`) are never cached — they're
   transient by nature, and the second kind isn't a fact about the source at
@@ -287,11 +329,15 @@ for benchmark comparisons.
 
 - **Google Books skip** — handled client-side (`isGoogleBooksUrl` in the
   userscript); this service never receives those URLs.
-- **Wayback/Internet Archive fallback orchestration** — also client-side.
-  When a live fetch fails, the client itself queries archive.org and, if a
-  snapshot exists, calls this service again with a
-  `web.archive.org/web/<timestamp>id_/<original-url>` URL — just another URL
-  to fetch, no special-casing needed here.
+- **Wayback/Internet Archive fallback orchestration** — deciding *when* to
+  fall back to archive.org is still client-side: when a live fetch fails,
+  the client itself queries archive.org and, if a snapshot exists, calls
+  this service again with a `web.archive.org/web/<timestamp>id_/<original-url>`
+  URL. Once that URL arrives here, though, it isn't treated as just another
+  URL — see [Politeness and concurrency](#one-host-isnt-always-one-publisher)
+  and [Caching](#caching) above for the per-host override and the long
+  immutable-content TTL that specific host gets, both added because a large,
+  measured share of real citation traffic goes through it.
 - **LLM routing of any kind** — that's `llm-router`, a separate Toolforge tool.
 - **`/log`** — the Worker's telemetry endpoint (writes verification results
   to Postgres) is left on the Cloudflare Worker for now; it isn't fetching,
@@ -315,12 +361,14 @@ All via environment variables (Toolforge envvars, never committed files):
 | `HOST_MAX_QUEUE_DEPTH` | `64` | hard cap on queued waiters per host |
 | `HOST_BACKOFF_MS` | `30000` | cooldown for a host after it returns 429 |
 | `HOST_BACKOFF_MAX_MS` | `600000` | ceiling on a `Retry-After` we'll honour from a host |
+| `HOST_OVERRIDES_JSON` | *(unset)* | JSON object of `hostname -> {maxConcurrency, minIntervalMs}`, merged over the built-in defaults (which include `web.archive.org`) |
 | `MAX_CONCURRENT_FETCHES` | `16` | process-wide ceiling on simultaneous upstream fetches |
 | `CAPACITY_MAX_QUEUE_WAIT_MS` | `15000` | how long a request may wait for a global slot before we shed it |
 | `ROBOTS_TIMEOUT_MS` | `5000` | timeout for fetching `robots.txt` |
 | `ROBOTS_CACHE_TTL_MS` | `3600000` | how long a host's `robots.txt` is cached |
 | `CACHE_TTL_OK_SECONDS` | `86400` | cache TTL for successful upstream responses |
 | `CACHE_TTL_ERROR_SECONDS` | `3600` | cache TTL for real (non-null) error statuses |
+| `CACHE_TTL_IMMUTABLE_SECONDS` | `2592000` | cache TTL for a pinned Wayback snapshot (30 days) |
 
 ## Development
 
