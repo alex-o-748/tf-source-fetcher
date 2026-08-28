@@ -13,18 +13,15 @@ separately by `llm-router`. This service does fetching and extraction only;
 it does not proxy chat completions and does not implement `/log` (see
 [Out of scope](#out-of-scope) below).
 
-## ⚠️ Deployment status: built, not live
+## ✅ Deployment status: live
 
 Unattended fetching of third-party publisher URLs from Wikimedia
-infrastructure has **not yet been cleared with WMCS** (Wikimedia Cloud
-Services). This service is built, deployable, and smoke-testable, but:
-
-- The userscript's default `workerBase` still points at the Cloudflare Worker.
-- No batch job should be pointed at this service's production path.
-
-Do not wire this in as the live path until the WMCS egress question is
-resolved. If you're unsure whether that's happened, ask before flipping the
-switch.
+infrastructure has been cleared with WMCS (Wikimedia Cloud Services), and
+the Internet Archive has confirmed the request volume this service expects
+(up to ~100,000 requests) is fine on their end — they didn't specify a
+rate beyond "watch for `429`s," which this service already does per-host
+(see [Politeness](#politeness)). This service is ready for production
+traffic.
 
 ## API contract
 
@@ -224,9 +221,10 @@ declares `web: node server.js`; the platform assigns `PORT`.
 
 After deploying, smoke-test `GET /?fetch=<url>` against a live HTML page, a
 PDF, and a URL that 403s, and confirm CORS preflight succeeds from an
-`en.wikipedia.org` origin — then leave it there, reachable but not yet wired
-into the userscript or batch job, until WMCS has cleared egress (see
-[Deployment status](#-deployment-status-built-not-live) above).
+`en.wikipedia.org` origin — then it's clear to wire into the userscript
+(pointing `workerBase` at this service instead of the Cloudflare Worker)
+and the batch job (see [Deployment status](#-deployment-status-live)
+above).
 
 ## License
 
