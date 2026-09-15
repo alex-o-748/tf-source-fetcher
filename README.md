@@ -293,22 +293,45 @@ what Readability reports for title/byline/publishedTime/siteName, and the
 header this service would return — which is what answers "would the
 publication date survive on *this* page?".
 
-Worth knowing when checking a page by eye first: **Firefox Reader View is
-Readability**, so it is a good proxy for what this service used to return —
-but read it carefully, because a date being visible there does not mean the
-date was safe.
+### Don't use Firefox Reader View to check this
 
-Reader View renders the domain, title, byline, reading time and the article
-body. It never renders `publishedTime`. So a date on screen is a date that
-was in the **body prose**, and a date missing from Reader View may still be
-sitting in the metadata this service now reads. Two real examples:
+**Firefox Reader View is Readability**, which makes it look like a free way to
+see what this service gets. It is not, in either direction — use the script.
 
-| Page | Reader View | Why |
-|---|---|---|
-| 9to5Mac | byline `Chance Miller`, no date | The date was a sibling of the `rel="author"` link inside the byline container, so it was removed with it — the case `captureBylineText`'s widen-to-parent step exists for |
-| Reuters | `Sept 9 (Reuters) - Apple…` | Reuters' dateline convention puts the date in the first line of the article text, where nothing removes it (note it carries no year) |
+Reader View renders the domain, title, byline, reading time and body. It has
+no publication-date element at all, so a date is only ever visible because it
+rode along in the byline or the body. Which of those happens is decided by
+markup you cannot see:
 
-The script distinguishes these cases, which eyeballing Reader View cannot.
+| Markup | Reader View byline | Date in body | Date visible |
+|---|---|---|---|
+| A — the container itself carries `class="author-byline"` | `Chance Miller \| Aug 23 2026` | no | yes, in the credits |
+| B — outer `class="meta"`, inner `<a rel="author">` (9to5Mac) | `Chance Miller` | no | **no** |
+| C — as B, plus `<meta name="author">` | `Chance Miller` | no | **no** |
+| D — as A, plus `<meta name="author">` | `Chance Miller` | yes | yes, in the body |
+| E — date written as prose (Reuters' `Sept 9 (Reuters) -` dateline) | `null` | yes | yes, in the body |
+| F — date only in `<meta>` | `null` | no | **no** |
+
+Two rules drive the whole table. First, `_isValidByline` matches the *first*
+node with `rel="author"`, `itemprop=author` or a byline-ish class, under 100
+chars — so whether the date rides along depends on whether that node is the
+container holding name *and* date (A) or an inner link holding just the name
+(B). Second, `_grabArticle` only strips a byline node when it has no byline
+from metadata:
+
+```js
+if (!this._articleByline && !this._metadata.byline && this._isValidByline(node, matchString))
+```
+
+which is why adding `<meta name="author">` makes the visible byline *survive
+in the body* (D vs A). A tag about the author decides whether the date is
+deleted.
+
+The trap for anyone checking by eye is row **A**: Reader View shows the date,
+but the pre-fix service still lost it, because the date was in
+`article.byline` and only `textContent` was returned. A date on screen never
+meant the fetcher had it. `scripts/inspect-url.js` reports `byline` and
+`publishedTime` separately, which is the distinction Reader View collapses.
 
 ## Toolforge deployment
 
