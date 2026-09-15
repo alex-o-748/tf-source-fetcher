@@ -282,6 +282,34 @@ traffic onto this service, smoke-test it manually against a few real URLs
 (a live HTML page, a PDF, and a URL that's known to 403) from an environment
 with normal internet access, or from Toolforge itself post-deploy.
 
+`scripts/inspect-url.js` is that smoke test, for one URL at a time:
+
+```sh
+node scripts/inspect-url.js https://example.com/some-article
+```
+
+It prints the extraction path taken, every date-ish `<meta>` tag on the page,
+what Readability reports for title/byline/publishedTime/siteName, and the
+header this service would return — which is what answers "would the
+publication date survive on *this* page?".
+
+Worth knowing when checking a page by eye first: **Firefox Reader View is
+Readability**, so it is a good proxy for what this service used to return —
+but read it carefully, because a date being visible there does not mean the
+date was safe.
+
+Reader View renders the domain, title, byline, reading time and the article
+body. It never renders `publishedTime`. So a date on screen is a date that
+was in the **body prose**, and a date missing from Reader View may still be
+sitting in the metadata this service now reads. Two real examples:
+
+| Page | Reader View | Why |
+|---|---|---|
+| 9to5Mac | byline `Chance Miller`, no date | The date was a sibling of the `rel="author"` link inside the byline container, so it was removed with it — the case `captureBylineText`'s widen-to-parent step exists for |
+| Reuters | `Sept 9 (Reuters) - Apple…` | Reuters' dateline convention puts the date in the first line of the article text, where nothing removes it (note it carries no year) |
+
+The script distinguishes these cases, which eyeballing Reader View cannot.
+
 ## Toolforge deployment
 
 ```sh
