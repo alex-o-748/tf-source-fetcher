@@ -50,8 +50,11 @@ GET /?fetch=<url-encoded target URL>&page=<optional 1-based page number>
 - **`status`** is the *upstream* site's HTTP status, not this service's own
   response status (see "Distinguishing refused from dead" below) — this is
   the single most important field.
-- **`content`** is only ever present when it's at least 101 characters;
-  shorter content is reported as the "no usable content" error below instead.
+- **`content`** is only ever present when the extracted *body* is at least 101
+  characters; shorter content is reported as the "no usable content" error
+  below instead. On the Readability path the body is preceded by a short
+  metadata header (see [Publication metadata](#publication-metadata)); that
+  header does not count toward the 101-character floor.
 - **`truncated`** is `true` whenever extracted text was cut off (currently at
   100,000 characters, matching the reference Worker's tuning). The client
   additionally treats any response with `content.length >= 12000` as
@@ -109,12 +112,81 @@ status if that field is missing, so either way is safe to depend on.
   constraints, so this is a meaningful upgrade over the Worker's regex tag
   stripping) and falls back to the Worker's original strip-and-collapse
   regex approach when Readability can't find an article (JS-only shells,
-  non-article pages).
+  non-article pages) or returns implausibly little of one. Unlike the Worker,
+  this path prefixes the text with the headline, byline and publication date —
+  see [Publication metadata](#publication-metadata) for why that is load-bearing.
 - PDF extraction uses [`unpdf`](https://github.com/unjs/unpdf), the same
   library the Worker uses, including per-page extraction when `page` is
   given.
 - The 100,000-character truncation cutoff matches the Worker's
   `.substring(0, 100000)` exactly.
+
+## Publication metadata
+
+`article.textContent` — all this service used to return — is the article
+**body**. Readability computes the headline, byline and publication date
+separately and removes them from that body: `_grabArticle` drops any node
+whose class/id matches `/byline|author|dateline|writtenby|p-author/i`, or
+which carries `rel="author"`, and parks the text in `article.byline`. On most
+news CMSes the publication date sits in that same element.
+
+The consequence was not cosmetic. A claim like *"the impressions appeared in
+August 2026"* is unverifiable against a source whose date has been stripped,
+and the verifier reports that as **the citation failing** rather than as the
+fetcher failing — so a fetcher-side omission surfaced to editors as a false
+"not supported" verdict. The reference Cloudflare Worker never had this
+problem, because crude tag-stripping keeps everything; the failure was
+specific to this service, and therefore to the batch pipeline that uses it.
+
+So on the Readability path the extracted text is now prefixed with whatever
+of these is available, followed by a blank line:
+
+```
+Title: Here’s what people who have used the iPhone Ultra like most
+Published: 2026-08-23T07:41:00-07:00
+By: Chance Miller | Aug 23 2026 - 7:41 am PT
+Site: 9to5Mac
+
+<article body>
+```
+
+- It goes at the **front** so the date outlives `MAX_CONTENT_CHARS`
+  truncation. In the Worker's output the date sits wherever it fell on the
+  page and is lost whenever the cut lands above it.
+- The byline is captured from the DOM **before** `parse()` runs, and widened
+  to the byline node's parent when that parent is also short. Markup like
+  `<div class="meta"><a rel="author">Name</a> | Aug 23 2026</div>` otherwise
+  loses the date entirely — Readability matches the inner `<a>`, records only
+  `Name`, and removes the whole container. The surrounding text is kept
+  verbatim rather than having a date pattern-matched out of it, since this
+  service follows citations to sources in any language.
+- `article.publishedTime` covers JSON-LD `datePublished`,
+  `article:published_time` and `parsely-pub-date`. A few more publication-date
+  tags (`itemprop="datePublished"`, `DC.date.issued`, …) and `<time datetime>`
+  inside a byline-ish container or a `<header>` are read as a fallback.
+- **Modification dates are deliberately not used.** Presenting a "last
+  updated" stamp as the publication date trades a missing fact for a wrong
+  one, which is worse for a verdict than silence. An unqualified
+  `time[datetime]` search is avoided for the same reason — it returns dates
+  the article is *about*.
+- The header is **not** added on the regex fallback path, which already keeps
+  whatever byline and date the page displayed.
+
+### Under-selection guard
+
+The fallback to regex extraction previously fired only when Readability
+returned *nothing*. A parse that returns a sliver of the wrong container —
+`aria-hidden="true"` wrappers are the realistic trigger, since collapsed
+accordions and "read more" panels carry it in the served HTML and are
+expanded by script this service never runs — cleared the 101-character floor
+and shipped as the source, which is worse than the crude extraction it
+replaced because it is confidently and silently wrong.
+
+Readability output under 500 characters is now compared against the regex
+extraction, and the regex result is preferred if it is at least 5× longer.
+The thresholds are deliberately far apart: Readability returns far less text
+than `regexExtract` on *every* page — that is the point of it — so the guard
+has to trigger on "a fragment instead of an article", never on "smaller".
 
 ## Politeness
 
@@ -191,6 +263,10 @@ npm start          # reads PORT (defaults to 8080), REDIS_URL, etc.
 npm test           # runs test/e2e.test.js against a local fixture server
 ```
 
+`test/extractHtml.test.js` covers text extraction directly — the byline/date
+shapes above, the metadata header, the under-selection guard, and truncation.
+It needs no network and no Redis, so `npm run test:unit` runs anywhere.
+
 `test/e2e.test.js` spins up a local fixture "publisher" server
 (`test/fixtures-server.js`) and exercises the full pipeline against it —
 HTML extraction, PDF extraction (against a bundled sample PDF), the
@@ -205,6 +281,57 @@ fixture server rather than real internet URLs. Before flipping any live
 traffic onto this service, smoke-test it manually against a few real URLs
 (a live HTML page, a PDF, and a URL that's known to 403) from an environment
 with normal internet access, or from Toolforge itself post-deploy.
+
+`scripts/inspect-url.js` is that smoke test, for one URL at a time:
+
+```sh
+node scripts/inspect-url.js https://example.com/some-article
+```
+
+It prints the extraction path taken, every date-ish `<meta>` tag on the page,
+what Readability reports for title/byline/publishedTime/siteName, and the
+header this service would return — which is what answers "would the
+publication date survive on *this* page?".
+
+### Don't use Firefox Reader View to check this
+
+**Firefox Reader View is Readability**, which makes it look like a free way to
+see what this service gets. It is not, in either direction — use the script.
+
+Reader View renders the domain, title, byline, reading time and body. It has
+no publication-date element at all, so a date is only ever visible because it
+rode along in the byline or the body. Which of those happens is decided by
+markup you cannot see:
+
+| Markup | Reader View byline | Date in body | Date visible |
+|---|---|---|---|
+| A — the container itself carries `class="author-byline"` | `Chance Miller \| Aug 23 2026` | no | yes, in the credits |
+| B — outer `class="meta"`, inner `<a rel="author">` (9to5Mac) | `Chance Miller` | no | **no** |
+| C — as B, plus `<meta name="author">` | `Chance Miller` | no | **no** |
+| D — as A, plus `<meta name="author">` | `Chance Miller` | yes | yes, in the body |
+| E — date written as prose (Reuters' `Sept 9 (Reuters) -` dateline) | `null` | yes | yes, in the body |
+| F — date only in `<meta>` | `null` | no | **no** |
+
+Two rules drive the whole table. First, `_isValidByline` matches the *first*
+node with `rel="author"`, `itemprop=author` or a byline-ish class, under 100
+chars — so whether the date rides along depends on whether that node is the
+container holding name *and* date (A) or an inner link holding just the name
+(B). Second, `_grabArticle` only strips a byline node when it has no byline
+from metadata:
+
+```js
+if (!this._articleByline && !this._metadata.byline && this._isValidByline(node, matchString))
+```
+
+which is why adding `<meta name="author">` makes the visible byline *survive
+in the body* (D vs A). A tag about the author decides whether the date is
+deleted.
+
+The trap for anyone checking by eye is row **A**: Reader View shows the date,
+but the pre-fix service still lost it, because the date was in
+`article.byline` and only `textContent` was returned. A date on screen never
+meant the fetcher had it. `scripts/inspect-url.js` reports `byline` and
+`publishedTime` separately, which is the distinction Reader View collapses.
 
 ## Toolforge deployment
 
