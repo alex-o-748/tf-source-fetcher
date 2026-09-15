@@ -164,7 +164,10 @@ async function fetchAndExtract(targetUrl, pageParam) {
   const html = buf.toString('utf8');
   const extracted = extractHtml(html, targetUrl);
 
-  if (extracted.content.length < MIN_CONTENT_CHARS) {
+  // bodyChars, not content.length: content carries a Title/Published/By
+  // header, and a login wall with a long headline and byline would otherwise
+  // clear this floor on metadata alone and be reported as usable content.
+  if (extracted.bodyChars < MIN_CONTENT_CHARS) {
     return { ...emptyResultBase(response.status, fetchedAt), error: NO_CONTENT_ERROR };
   }
 
