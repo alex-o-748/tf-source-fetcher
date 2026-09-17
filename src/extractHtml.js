@@ -1,7 +1,7 @@
 'use strict';
 
-const { JSDOM } = require('jsdom');
 const { Readability, isProbablyReaderable } = require('@mozilla/readability');
+const { prepareMarkup, parseDocument } = require('./parseDocument');
 const { MAX_CONTENT_CHARS } = require('./config');
 
 // Below this, Readability's output is short enough to be suspicious rather
@@ -204,12 +204,21 @@ function buildHeader({ title, byline, publishedTime, siteName }) {
 // page yielded usable content must use it, since a cookie wall with a fat
 // <title> and byline can clear a content floor on header text alone.
 function extractHtml(html, url) {
+  // Bound the input before either extraction path touches it. Building a DOM
+  // costs ~130 MB of heap per MB of markup and the regex chain is no cheaper,
+  // so an unbounded page is a fatal OOM rather than a slow request — that is
+  // what was killing the pod. See src/parseDocument.js. Everything below runs
+  // on `markup`, never on `html`.
+  const { markup, clamped } = prepareMarkup(html);
+
   let readabilityText = '';
   let header = '';
 
   try {
-    const dom = new JSDOM(html, { url });
-    const doc = dom.window.document;
+    // parseDocument, not `new JSDOM(markup, { url })`: the latter builds a
+    // Window per page, ~1.8 MB of garbage that only a full mark-compact
+    // retires, on a heap this service was already driving to its ceiling.
+    const doc = parseDocument(markup, url);
     if (isProbablyReaderable(doc)) {
       // Both of these must be read before parse(): Readability mutates the
       // document it is handed, removing the very nodes they look at.
@@ -248,10 +257,10 @@ function extractHtml(html, url) {
   if (body.length === 0) {
     // Readability found no article at all — the original unconditional
     // fallback, unchanged: whatever the regex yields is what we have.
-    body = regexExtract(html);
+    body = regexExtract(markup);
     usedFallback = true;
   } else if (body.length < MIN_READABILITY_CHARS) {
-    const regexText = regexExtract(html);
+    const regexText = regexExtract(markup);
     if (regexText.length >= Math.max(body.length * UNDERSELECTION_RATIO, MIN_READABILITY_CHARS)) {
       body = regexText;
       usedFallback = true;
@@ -265,7 +274,12 @@ function extractHtml(html, url) {
   }
 
   const { content, truncated } = truncate(`${header}${body}`);
-  return { content, truncated, bodyChars: body.length };
+  // `clamped` means we never saw the whole page, so the text we return may
+  // stop short of evidence that was there. That is the same fact `truncated`
+  // already carries for the MAX_CONTENT_CHARS cut, and the citation verifier
+  // downstream treats a truncated source differently from a complete one — so
+  // it has to be reported, not swallowed.
+  return { content, truncated: truncated || clamped, bodyChars: body.length };
 }
 
 module.exports = { extractHtml };

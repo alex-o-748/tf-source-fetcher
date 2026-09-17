@@ -12,8 +12,8 @@
 // per-channel breakdown needed to answer "would the date survive on THIS
 // page?" without reading the extractor's source.
 
-const { JSDOM } = require('jsdom');
 const { Readability, isProbablyReaderable } = require('@mozilla/readability');
+const { parseDocument } = require('../src/parseDocument');
 const { extractHtml } = require('../src/extractHtml');
 const { USER_AGENT } = require('../src/config');
 
@@ -33,8 +33,10 @@ async function main() {
 
   // Report each date channel separately, against an unmutated document.
   // Readability.parse() rewrites the DOM it is given, so this parse must be
-  // its own; the one inside extractHtml below gets a fresh document.
-  const doc = new JSDOM(html, { url }).window.document;
+  // its own; parseDocument returns a fresh document every call, and using it
+  // (rather than jsdom directly) is what keeps this diagnostic honest — it
+  // parses the page exactly the way the service does.
+  const doc = parseDocument(html, url);
   console.log(`isProbablyReaderable : ${isProbablyReaderable(doc)}`);
   if (!isProbablyReaderable(doc)) {
     console.log('  -> regex fallback path: nothing is removed, so nothing is lost.\n');
@@ -54,7 +56,7 @@ async function main() {
       : '  (none)'
   );
 
-  const article = new Readability(new JSDOM(html, { url }).window.document).parse();
+  const article = new Readability(parseDocument(html, url)).parse();
   console.log('\nwhat Readability itself reports:');
   console.log(`  title         : ${article && article.title}`);
   console.log(`  byline        : ${article && article.byline}`);

@@ -30,8 +30,24 @@ module.exports = {
   // Response body size guards. Toolforge gives this tool a heavier memory
   // budget than the other two tools specifically for PDF parsing / large
   // buffers, so these are a bit more generous than the Worker's 10 MB PDF cap.
+  //
+  // Note these bound the *download*, not the parse. Accepting 20 MB of HTML is
+  // fine; handing 20 MB of HTML to a DOM parser is not — see MAX_PARSE_BYTES.
   MAX_HTML_BYTES: Number(process.env.MAX_HTML_BYTES) || 20 * 1024 * 1024,
   MAX_PDF_BYTES: Number(process.env.MAX_PDF_BYTES) || 25 * 1024 * 1024,
+
+  // How much markup we are willing to extract text from, after scripts,
+  // stylesheets and comments have been dropped. This is a memory limit, not a
+  // content one: extraction costs roughly 130 MB of peak heap per MB of
+  // markup, so on a pod whose Node heap ceiling is ~256 MB, one 2 MB page is
+  // fatal. 512 KB is ~70 MB of peak in the worst (markup-dense) case, which
+  // leaves room for concurrent requests. Raising this needs proportionally
+  // more memory on the webservice — see the README before you do.
+  //
+  // It costs real articles nothing: output is capped at MAX_CONTENT_CHARS
+  // above, and 128 KB of article-dense markup already yields more text than
+  // that.
+  MAX_PARSE_BYTES: Number(process.env.MAX_PARSE_BYTES) || 512 * 1024,
 
   // Per-host politeness: minimum gap between two outbound requests to the
   // same host, and how long a request may queue waiting for its turn before

@@ -55,10 +55,15 @@ GET /?fetch=<url-encoded target URL>&page=<optional 1-based page number>
   below instead. On the Readability path the body is preceded by a short
   metadata header (see [Publication metadata](#publication-metadata)); that
   header does not count toward the 101-character floor.
-- **`truncated`** is `true` whenever extracted text was cut off (currently at
-  100,000 characters, matching the reference Worker's tuning). The client
-  additionally treats any response with `content.length >= 12000` as
-  truncated on its own, regardless of this flag.
+- **`truncated`** is `true` whenever we did not return the whole source. Two
+  causes: the extracted text was cut at 100,000 characters (matching the
+  reference Worker's tuning), or the page itself was too large to extract from
+  in full and was cut at `MAX_PARSE_BYTES` before extraction (see
+  [Memory](#memory-what-killed-this-service-and-what-bounds-it-now)). Either
+  way the meaning for a caller is the same — evidence may lie past the cut —
+  which is why they share a flag. The client additionally treats any response
+  with `content.length >= 12000` as truncated on its own, regardless of this
+  flag.
 - **`pdf` / `totalPages` / `page`** — set for PDFs; `page` is only non-null
   when the caller passed a `page` param and it was honored.
 - **`fetched_at`** — ISO timestamp of the actual upstream fetch. Used by the
@@ -120,6 +125,110 @@ status if that field is missing, so either way is safe to depend on.
   given.
 - The 100,000-character truncation cutoff matches the Worker's
   `.substring(0, 100000)` exactly.
+
+## Memory: what killed this service, and what bounds it now
+
+Read this before touching `src/parseDocument.js`, before raising
+`MAX_PARSE_BYTES`, and before reintroducing `new JSDOM()` anywhere in the
+request path.
+
+**The symptom.** The web pod was crash-looping: 27 restarts in 2 days, exit
+139, `FATAL ERROR: Ineffective mark-compacts near heap limit` at 254 MB, with
+hundreds of `Could not parse CSS stylesheet` lines ahead of each trace. During
+each restart the front proxy has no backend and answers 502, so a batch sweep
+saw its fetch failure rate climb from 13% to 60% over a few hours. That looks
+exactly like a degrading upstream, or like us overloading something, and is
+neither — it is one process crossing more and more restart windows. The tells:
+identical URLs that returned 200 earlier returning 502 later, many unrelated
+domains failing at once, and a `RESTARTS` count climbing in `kubectl get pods`.
+
+Two separate things were wrong. The second is the one that actually killed it.
+
+### 1. Churn: a jsdom Window per page
+
+`new JSDOM(html, { url })` builds a Window/browsing context per page — CSSOM,
+timers, navigator — and each one is ~1.8 MB of garbage that only a full
+mark-compact with idle time retires.
+
+It is **not** a permanent leak. A tight synchronous loop appears to leak
+1.76 MB/page and never plateau, but that is a measurement artifact: two
+`global.gc()` calls are not enough to retire a backlog of detached V8 contexts.
+Given ~20 GC rounds with idle time between them, V8 reclaims nearly all of it
+(16 KB/page residual), and the service under request load — which has idle time
+by construction — measured flat with the old code too. So this alone does not
+crash anything.
+
+What it does is put 1.8 MB of pressure per request on a heap that (2) was
+already driving to its ceiling. `src/parseDocument.js` builds exactly one
+Window for the life of the process and parses every page into a fresh,
+window-less `Document` with that Window's `DOMParser` — the same Document type
+a browser hands Readability. Measured 0.006 MB/page retained against 1.76, and
+~2x faster per page. Extraction output is byte-identical across article,
+JS-shell, malformed, fallback and metadata-header cases.
+
+`JSDOM.fragment()` — the fix citation-checker-script's batch pipeline used for
+the same jsdom cost — is not available here: it returns a `DocumentFragment`,
+and Readability requires a real `Document`. Recycling the shared Window
+periodically is worse than not, measured: building a replacement costs more
+than the residual it reclaims (10.7 vs 5.1 KB/page).
+
+### 2. Peak: extraction costs ~130 MB of heap per MB of markup
+
+This is the crash. Peak heap while extracting **one** page, `heapUsed` sampled
+every 2 ms, dense markup (the bad case):
+
+| HTML | Peak | | HTML | Peak |
+|---|---|---|---|---|
+| 128 KB | +33 MB | | 1 MB | +140 MB |
+| 256 KB | +46 MB | | 2 MB | +269 MB |
+| 512 KB | +70 MB | | 5 MB | process dies |
+
+`MAX_HTML_BYTES` is 20 MB, so a single large page could demand ~2.6 GB against
+a ~256 MB Node heap. No accumulation required, nothing that more uptime or more
+GC improves, and nothing specific to jsdom — the regex fallback peaked at
++262 MB on a 20 MB page, because each `.replace()` in the chain allocates
+another copy of the string.
+
+Reproduced end-to-end against the real server at `--max-old-space-size=256`,
+serving pages the download cap allows:
+
+```
+              before the fix              after the fix
+0.5 MB page   200, heap 113 MB            200, heap 108 MB
+  1 MB page   200, heap 177 MB            200, heap 106 MB
+  2 MB page   200, heap 172 MB            200, heap 118 MB
+  4 MB page   FATAL heap OOM, pod gone    200, heap 112 MB
+  8 MB page   —                           200, heap 108 MB
+```
+
+Every one of those pages still returns the full 100,000 characters of content.
+
+So `prepareMarkup()` bounds what either extraction path is allowed to see:
+scripts, stylesheets and comments are dropped first — pure weight for a text
+extractor, and on a modern news page the inline JSON state blob is often most
+of the bytes — and whatever is still over `MAX_PARSE_BYTES` (512 KB) is cut at
+a tag boundary. Because the strip runs before the cut, a page that is mostly
+script keeps its whole article.
+
+**Raising `MAX_PARSE_BYTES` costs ~130 MB of peak heap per MB.** Do not raise
+it without giving the webservice proportionally more memory, and re-run
+`test/parseDocument.test.js` after you do.
+
+It costs real articles nothing: output is capped at `MAX_CONTENT_CHARS`
+(100,000) anyway, and 128 KB of article-dense markup already yields more text
+than that. When a page *is* cut for size, the response says so —
+`truncated: true`, the same flag the 100,000-character cut sets, because
+"we did not read all of this source" is a fact the citation verifier acts on.
+
+### What is still unbounded
+
+`MAX_PDF_BYTES` is 25 MB and the PDF path (`unpdf`) has no equivalent parse
+budget. It has not been measured, and it is the obvious next place to look if
+the pod dies again on a URL ending in `.pdf`.
+
+`src/robots.js` and `src/rateLimiter.js` keep per-host `Map`s that are never
+evicted. Bounded by how many distinct hosts a process sees, and small per
+entry — not a crash risk at this scale, but not free either.
 
 ## Publication metadata
 
@@ -245,8 +354,9 @@ All via environment variables (Toolforge envvars, never committed files):
 | `REDIS_URL` | `redis://tools-redis:6379` | Toolforge's shared Redis instance |
 | `DISABLE_CACHE` | unset | set to `1` to run without a cache |
 | `FETCH_TIMEOUT_MS` | `20000` | upstream fetch timeout (connect + body read) |
-| `MAX_HTML_BYTES` | `20971520` (20 MB) | HTML response size guard |
-| `MAX_PDF_BYTES` | `26214400` (25 MB) | PDF response size guard |
+| `MAX_HTML_BYTES` | `20971520` (20 MB) | HTML **download** size guard |
+| `MAX_PDF_BYTES` | `26214400` (25 MB) | PDF download size guard |
+| `MAX_PARSE_BYTES` | `524288` (512 KB) | how much markup we extract text from, after scripts/styles/comments are dropped. A **memory** limit — costs ~130 MB of peak heap per MB. [Read this first](#memory-what-killed-this-service-and-what-bounds-it-now) |
 | `HOST_MIN_INTERVAL_MS` | `1000` | minimum gap between requests to the same host |
 | `HOST_MAX_QUEUE_WAIT_MS` | `8000` | how long a request may queue before we give up and return 429 |
 | `HOST_BACKOFF_MS` | `30000` | cooldown for a host after it returns 429 |
@@ -266,6 +376,15 @@ npm test           # runs test/e2e.test.js against a local fixture server
 `test/extractHtml.test.js` covers text extraction directly — the byline/date
 shapes above, the metadata header, the under-selection guard, and truncation.
 It needs no network and no Redis, so `npm run test:unit` runs anywhere.
+
+`test/parseDocument.test.js` covers HTML parsing and the two memory bugs behind
+the crash loop (see [Memory](#memory-what-killed-this-service-and-what-bounds-it-now)):
+the size bound on what reaches a parser, the one-Window-per-process property,
+and two measuring tests — peak heap for a single oversized page, and heap
+retained per page. `node --test` doesn't run with `--expose-gc`, so those two
+ask V8 for a GC directly and skip themselves if they can't get one. They take a
+few seconds — they parse an 8 MB page and then 150 normal ones — which is why
+this is the one unit test file that isn't instant.
 
 `test/e2e.test.js` spins up a local fixture "publisher" server
 (`test/fixtures-server.js`) and exercises the full pipeline against it —
@@ -345,6 +464,29 @@ toolforge webservice buildservice start
 
 Runtime: Node 20+ via Toolforge's buildpack-based build service. `Procfile`
 declares `web: node server.js`; the platform assigns `PORT`.
+
+### When callers report a rash of 502s
+
+Check whether the pod is alive before you believe anything about upstreams:
+
+```sh
+become source-fetcher
+kubectl get pods                                  # RESTARTS and AGE
+kubectl describe pod <pod> | grep -A6 "Last State"
+kubectl logs <pod> --previous --tail=50           # the trace from the crash
+```
+
+A climbing `RESTARTS` count means the 502s are this service being down, not the
+sources refusing us — every request in flight during a restart gets one. Note
+the caller sees the same 502 either way, so a client-side failure *rate* can't
+distinguish them; the restart count can. `Exit Code: 139` with a
+`FATAL ERROR: Ineffective mark-compacts near heap limit` in the previous logs
+is the heap ceiling, and the ceiling is set by the webservice's memory
+allocation (Node sizes its old space from what the container gives it) —
+`toolforge webservice restart --mem 2Gi` raises it, which buys headroom but
+fixes nothing on its own. See
+[Memory](#memory-what-killed-this-service-and-what-bounds-it-now) for the two
+causes that did this once already, and for what is still unbounded.
 
 After deploying, smoke-test `GET /?fetch=<url>` against a live HTML page, a
 PDF, and a URL that 403s, and confirm CORS preflight succeeds from an
