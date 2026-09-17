@@ -51,4 +51,12 @@ async function isAllowedByRobots(targetUrl) {
   return allowed !== false;
 }
 
-module.exports = { isAllowedByRobots };
+// How many origins this cache is holding. Entries are never evicted — an
+// expired one is overwritten, not deleted — so this only ever grows, once per
+// distinct origin seen. Read by src/metrics.js, because a heap that grows in
+// step with this number points here rather than at anything per-request.
+function robotsCacheSize() {
+  return cache.size;
+}
+
+module.exports = { isAllowedByRobots, robotsCacheSize };
