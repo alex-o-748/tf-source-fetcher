@@ -31,6 +31,11 @@ GET /?fetch=<url-encoded target URL>&page=<optional 1-based page number>
 
 `page` only applies to paginated PDFs; most callers won't send it.
 
+There is also `GET /metrics`, which returns process counters and memory as
+JSON. It is temporary diagnostic scaffolding, not part of the contract — see
+[the instrumentation](#the-instrumentation-temporary). It reports counts and
+memory only: no URLs, no fetched content, nothing a caller supplied.
+
 ### Response — success
 
 ```json
@@ -220,6 +225,55 @@ than that. When a page *is* cut for size, the response says so —
 `truncated: true`, the same flag the 100,000-character cut sets, because
 "we did not read all of this source" is a fact the citation verifier acts on.
 
+### The instrumentation (temporary)
+
+**After** the parse budget and the shared-Window parser were deployed
+(digest `198d71de`, confirmed by the absence of `Could not parse CSS
+stylesheet` in the logs), the pod still filled a **1 GB heap in 22 minutes**
+and died the same way. So a second, larger source of growth exists that none
+of the measurements above found — on the order of a megabyte per request,
+roughly 100x the Window churn that was fixed.
+
+Every reproduction that failed to find it shares one flaw: they hit **one
+local plain-HTTP origin**. Production hits thousands of distinct HTTPS
+origins, close to one new origin per request for a citation sweep. That gap
+covers undici's per-origin connection pools and TLS state, and the two Maps
+in this process that grow once per origin and are never evicted.
+
+Rather than guess between those, `src/metrics.js` measures. It adds:
+
+- a `[mem]` line every `MEM_LOG_EVERY` requests (default 50, `0` to disable);
+- `GET /metrics`, the same numbers as JSON, pollable at any time.
+
+```
+[mem] req=500 (+50 in 61s) ok=412 http=61 net=27 robots=0 rl=0 cached=0
+      nocontent=9 pdf=3 bytes=612.4MB (+58.1MB) hosts=robots:431/limiter:433
+      rss=712.3MB heap=604.1/1024.0MB ext=18.2MB ab=2.1MB
+      | retained +42.8MB = +0.856MB/req
+```
+
+Reading it:
+
+| If growth tracks | Then it is | Look at |
+|---|---|---|
+| `req` | per-request retention | what a request holds after it returns |
+| `hosts` | per-origin retention | `robots.js`'s cache, `rateLimiter.js`'s Maps, undici's pools |
+| `bytes` | what we read, not how often | buffers and extracted strings |
+
+**Ignore the first line or two** — V8 code objects, Readability's regex caches
+and the shared parser Window are one-off costs that land in the first
+interval and would otherwise read as a huge per-request figure.
+
+This is scaffolding, not a feature. Once the growth is identified and fixed,
+deleting `src/metrics.js`, `test/metrics.test.js`, the `MEM_LOG_EVERY` entry
+in `src/config.js`, the `bytes` field in `src/fetchTarget.js` and the calls in
+`server.js` should leave no trace.
+
+If a heap snapshot is wanted instead, `NODE_OPTIONS=--heapsnapshot-near-heap-limit=1`
+as a Toolforge envvar makes the next OOM dump one — but it writes a file about
+the size of the heap (~1 GB) into the pod's working directory as it dies, so
+check disk before enabling it.
+
 ### What is still unbounded
 
 `MAX_PDF_BYTES` is 25 MB and the PDF path (`unpdf`) has no equivalent parse
@@ -364,6 +418,7 @@ All via environment variables (Toolforge envvars, never committed files):
 | `ROBOTS_CACHE_TTL_MS` | `3600000` | how long a host's `robots.txt` is cached |
 | `CACHE_TTL_OK_SECONDS` | `86400` | cache TTL for successful upstream responses |
 | `CACHE_TTL_ERROR_SECONDS` | `3600` | cache TTL for real (non-null) error statuses |
+| `MEM_LOG_EVERY` | `50` | emit a `[mem]` line every N requests; `0` disables it (`/metrics` still works). [Temporary](#the-instrumentation-temporary) |
 
 ## Development
 
@@ -385,6 +440,12 @@ retained per page. `node --test` doesn't run with `--expose-gc`, so those two
 ask V8 for a GC directly and skip themselves if they can't get one. They take a
 few seconds — they parse an 8 MB page and then 150 normal ones — which is why
 this is the one unit test file that isn't instant.
+
+`test/metrics.test.js` covers the diagnostic instrumentation — that counters
+count, that the deltas are per-interval rather than cumulative (a cumulative
+delta would make MB/req appear to fall as the process aged, which is exactly
+backwards), and that a throwing gauge costs a field in a log line rather than
+somebody's request.
 
 `test/e2e.test.js` spins up a local fixture "publisher" server
 (`test/fixtures-server.js`) and exercises the full pipeline against it —

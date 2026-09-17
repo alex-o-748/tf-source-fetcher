@@ -74,9 +74,13 @@ function isPdf(targetUrl, contentType) {
 //   { networkError: true, error }                    — upstream unreachable
 //   { invalidPage: true, error, status, totalPages }  — bad `page` for a PDF
 //   { content, error, status, pdf, totalPages, page, truncated, fetchedAt }
+//
+// Every shape that got as far as reading a body also carries `bytes`, the
+// size of that body — reported to src/metrics.js and nothing else.
 async function fetchAndExtract(targetUrl, pageParam) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  let bytes = 0;
 
   let response;
   try {
@@ -115,6 +119,9 @@ async function fetchAndExtract(targetUrl, pageParam) {
   let buf;
   try {
     buf = await readBodyWithLimit(response, pdf ? MAX_PDF_BYTES : MAX_HTML_BYTES);
+    // Reported to src/metrics.js. Heap growth that tracks bytes read rather
+    // than requests served is a different bug from one that tracks either.
+    bytes = buf.byteLength;
   } catch (e) {
     clearTimeout(timer);
     if (e.code === 'TOO_LARGE') {
@@ -139,14 +146,15 @@ async function fetchAndExtract(targetUrl, pageParam) {
           status: response.status,
           totalPages: e.totalPages,
           fetchedAt,
+          bytes,
         };
       }
       // Corrupt/unparseable PDF: we got a response, just nothing usable.
-      return { ...emptyResultBase(response.status, fetchedAt), error: NO_CONTENT_ERROR };
+      return { ...emptyResultBase(response.status, fetchedAt), error: NO_CONTENT_ERROR, bytes };
     }
 
     if (extracted.content.length < MIN_CONTENT_CHARS) {
-      return { ...emptyResultBase(response.status, fetchedAt), error: NO_CONTENT_ERROR };
+      return { ...emptyResultBase(response.status, fetchedAt), error: NO_CONTENT_ERROR, bytes };
     }
 
     return {
@@ -158,6 +166,7 @@ async function fetchAndExtract(targetUrl, pageParam) {
       page: extracted.page,
       truncated: extracted.truncated,
       fetchedAt,
+      bytes,
     };
   }
 
@@ -168,7 +177,7 @@ async function fetchAndExtract(targetUrl, pageParam) {
   // header, and a login wall with a long headline and byline would otherwise
   // clear this floor on metadata alone and be reported as usable content.
   if (extracted.bodyChars < MIN_CONTENT_CHARS) {
-    return { ...emptyResultBase(response.status, fetchedAt), error: NO_CONTENT_ERROR };
+    return { ...emptyResultBase(response.status, fetchedAt), error: NO_CONTENT_ERROR, bytes };
   }
 
   return {
@@ -180,6 +189,7 @@ async function fetchAndExtract(targetUrl, pageParam) {
     page: null,
     truncated: extracted.truncated,
     fetchedAt,
+    bytes,
   };
 }
 

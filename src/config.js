@@ -57,6 +57,12 @@ module.exports = {
   // How long to back a host off after it returns a 429 to us.
   HOST_BACKOFF_MS: Number(process.env.HOST_BACKOFF_MS) || 30000,
 
+  // Diagnostic scaffolding: emit a `[mem]` line every N requests with process
+  // memory, counters and the size of the per-origin caches. 0 disables the
+  // periodic line (GET /metrics still works). See src/metrics.js for why this
+  // exists and when to delete it.
+  MEM_LOG_EVERY: Number(process.env.MEM_LOG_EVERY ?? 50),
+
   // Cache (Redis). Toolforge's shared Redis instance is documented as
   // reachable at tools-redis:6379 from any tool's containers; namespaced by
   // key prefix below so tools sharing the instance don't collide.

@@ -62,6 +62,12 @@ class HostRateLimiter {
       await sleep(wait);
     }
   }
+
+  // How many distinct hosts these Maps are holding. Nothing is ever evicted,
+  // so this only grows. Read by src/metrics.js — see robotsCacheSize().
+  size() {
+    return Math.max(this.nextAvailableAt.size, this.backoffUntil.size);
+  }
 }
 
 module.exports = { HostRateLimiter, RateLimitedError };

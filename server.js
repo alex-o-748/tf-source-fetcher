@@ -4,11 +4,21 @@ const http = require('http');
 
 const config = require('./src/config');
 const cache = require('./src/cache');
-const { isAllowedByRobots } = require('./src/robots');
+const { isAllowedByRobots, robotsCacheSize } = require('./src/robots');
 const { HostRateLimiter, RateLimitedError } = require('./src/rateLimiter');
 const { fetchAndExtract } = require('./src/fetchTarget');
+const metrics = require('./src/metrics');
 
 const hostLimiter = new HostRateLimiter();
+
+// Diagnostic scaffolding — see the header of src/metrics.js. These are the
+// two structures in this process that grow once per distinct origin and are
+// never evicted, which is the leading hypothesis for the heap growth that
+// outlived the parse-budget fix.
+metrics.setGauges(() => ({
+  robots: robotsCacheSize(),
+  limiter: hostLimiter.size(),
+}));
 
 function emptyContract(status, fetchedAt) {
   return {
@@ -56,6 +66,7 @@ async function handleFetch(targetUrl, pageParamRaw, res) {
 
   const cached = await cache.get(targetUrl, cacheKeyPage);
   if (cached) {
+    metrics.record({ cached: true, ok: isSuccessStatus(cached.status) && !!cached.content });
     sendJson(res, outerStatusFor(cached.status), { ...cached, cached: true });
     return;
   }
@@ -73,6 +84,7 @@ async function handleFetch(targetUrl, pageParamRaw, res) {
     await hostLimiter.acquire(host);
   } catch (e) {
     if (!(e instanceof RateLimitedError)) throw e;
+    metrics.record({ rateLimited: true });
     sendJson(res, 429, { ...emptyContract(429, null), error: e.message, cached: false });
     return;
   }
@@ -84,6 +96,7 @@ async function handleFetch(targetUrl, pageParamRaw, res) {
     if (pageIsValidInt) {
       await cache.set(targetUrl, cacheKeyPage, { ...body, cached: undefined }, cache.CACHE_TTL_ERROR_SECONDS);
     }
+    metrics.record({ robotsBlocked: true });
     sendJson(res, 403, body);
     return;
   }
@@ -93,11 +106,13 @@ async function handleFetch(targetUrl, pageParamRaw, res) {
   if (result.networkError) {
     // Never reached upstream at all — status stays null per contract, and
     // this is transient by nature so it's never cached.
+    metrics.record({ networkError: true });
     sendJson(res, 502, { ...emptyContract(null, null), error: result.error, cached: false });
     return;
   }
 
   if (result.invalidPage) {
+    metrics.record({ invalidPage: true, pdf: true, bytes: result.bytes });
     sendJson(res, 400, {
       ...emptyContract(result.status, result.fetchedAt),
       error: result.error,
@@ -127,6 +142,15 @@ async function handleFetch(targetUrl, pageParamRaw, res) {
     await cache.set(targetUrl, cacheKeyPage, body, ttl);
   }
 
+  metrics.record({
+    ok: !!result.content,
+    httpError: !isSuccessStatus(result.status),
+    noContent: isSuccessStatus(result.status) && !result.content,
+    pdf: !!result.pdf,
+    truncated: !!result.truncated,
+    bytes: result.bytes,
+  });
+
   sendJson(res, outerStatusFor(result.status), { ...body, cached: false });
 }
 
@@ -153,6 +177,14 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Diagnostic scaffolding — see the header of src/metrics.js. Counters and
+  // process memory only; no URLs, no fetched content, nothing a caller told
+  // us. Remove with the rest of the instrumentation once the leak is found.
+  if (url.pathname === '/metrics') {
+    sendJson(res, 200, metrics.snapshot());
+    return;
+  }
+
   if (url.pathname !== '/') {
     sendJson(res, 404, { content: null, error: 'Not found', status: 404 });
     return;
@@ -176,20 +208,25 @@ const server = http.createServer((req, res) => {
 
   const pageParamRaw = url.searchParams.get('page');
 
-  handleFetch(targetUrl, pageParamRaw, res).catch((err) => {
-    console.error('[server] unhandled error handling', targetUrl, err);
-    sendJson(res, 500, {
-      content: null,
-      error: 'Internal error',
-      status: 500,
-      pdf: false,
-      totalPages: null,
-      page: null,
-      truncated: false,
-      fetched_at: null,
-      cached: false,
-    });
-  });
+  handleFetch(targetUrl, pageParamRaw, res)
+    .catch((err) => {
+      console.error('[server] unhandled error handling', targetUrl, err);
+      metrics.record({ networkError: true });
+      sendJson(res, 500, {
+        content: null,
+        error: 'Internal error',
+        status: 500,
+        pdf: false,
+        totalPages: null,
+        page: null,
+        truncated: false,
+        fetched_at: null,
+        cached: false,
+      });
+    })
+    // One place, so every exit path above is counted exactly once and the
+    // periodic line can't be skipped by whichever branch returned.
+    .finally(() => metrics.maybeLog());
 });
 
 async function main() {
