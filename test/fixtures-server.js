@@ -61,6 +61,12 @@ const server = http.createServer((req, res) => {
     // Never responds — used to test the fetch timeout path.
     return;
   }
+  if (url.pathname === '/slow-body') {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.flushHeaders();
+    setTimeout(() => res.end(longArticleHtml()), 3000);
+    return;
+  }
   if (url.pathname === '/doc.pdf') {
     const buf = fs.readFileSync(PDF_FIXTURE);
     res.writeHead(200, { 'Content-Type': 'application/pdf' });

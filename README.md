@@ -131,6 +131,61 @@ status if that field is missing, so either way is safe to depend on.
 - The 100,000-character truncation cutoff matches the Worker's
   `.substring(0, 100000)` exactly.
 
+## Runtime budget and cancellation
+
+A cache miss has one wall-clock processing budget, configured with
+`PROCESSING_DEADLINE_MS` (20 seconds by default). The budget starts before the
+per-host queue and is shared by queueing, the robots.txt check, connecting to
+the source, redirects, downloading the complete response body, and extraction.
+`FETCH_TIMEOUT_MS` is still accepted as a deployment-compatibility alias, but
+it no longer creates a fresh network-only timer. A deadline response is HTTP
+504 with `status: null`.
+
+The service does **not** retry a source and does not perform a Wayback
+fallback. Those are caller policy. Consequently, internal retries cannot
+multiply the caller's original → Wayback availability → archived URL sequence;
+the sequence consists of two independent source-fetcher requests plus the
+caller's availability request. The caller should place one deadline around
+that entire sequence, pass its remaining time as the timeout for each request,
+and leave a small margin above this service's deadline so the structured 504
+can arrive. Giving every leg a fresh 30-second timer still permits a roughly
+90-second tail even though each fetcher request is individually bounded.
+
+The deadline's abort signal remains attached while the response body is read,
+so receiving headers does not disable it. A client disconnect also aborts the
+upstream source request. A shared in-flight robots.txt lookup is not cancelled
+when one client leaves, because doing so would fail unrelated requests waiting
+on the same lookup; only the departing request stops waiting. HTML extraction
+is synchronous JavaScript and PDF parsing does not expose cancellation, so
+work already executing inside those libraries cannot be preempted. The result
+is discarded if the signal has fired, but a single pathological extraction can
+delay the 504 until control returns to the event loop. Moving extraction to a
+worker thread would make that hard bound enforceable, but is deliberately not
+part of the smallest runtime fix.
+
+There is no evidence in this service of an attempt/backoff loop: the only
+intentional wait is the per-host politeness queue (at most
+`HOST_MAX_QUEUE_WAIT_MS`), while a cold robots lookup has its own five-second
+cap but now also consumes the shared processing budget. On a warm host, the
+remaining stages are one upstream fetch/body download and one extraction.
+
+Do not select a lower production budget from the default alone. Compare
+candidate values (10 and 15 seconds are useful starting cohorts, not targets)
+on the same representative URL sample and report:
+
+1. complete batch wall time;
+2. source latency p50/p90/p95/p99 and timeout count;
+3. usable extracted sources per minute (the primary throughput/quality metric);
+4. usable-source coverage (secondary).
+
+Run each candidate with a cold cache and the same four-worker caller pool, then
+repeat warm-cache runs separately. Stratify HTML/PDF, original/archive, and
+host so a PDF-heavy sample or one throttled origin cannot masquerade as a
+general optimum. This repository has deterministic coverage for connection
+stalls and a body that stalls after headers; live publisher timing must be
+measured from the batch environment because its network path and workload are
+not represented by the fixtures.
+
 ## Memory: what killed this service, and what bounds it now
 
 Read this before touching `src/parseDocument.js`, before raising

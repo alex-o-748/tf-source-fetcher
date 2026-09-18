@@ -125,6 +125,17 @@ test('slow/hanging host times out as a network error, not a hang', async () => {
   assert.ok(/timed out/i.test(body.error));
 });
 
+test('processing deadline remains active after upstream headers arrive', async () => {
+  const started = Date.now();
+  const { httpStatus, body } = await callFetch(`${FIXTURES_BASE}/slow-body`);
+  const elapsed = Date.now() - started;
+
+  assert.equal(httpStatus, 504);
+  assert.equal(body.status, null);
+  assert.match(body.error, /deadline exceeded/i);
+  assert.ok(elapsed < 2500, `deadline response took ${elapsed}ms`);
+});
+
 test('robots.txt disallowed path is blocked as a 403', async () => {
   const { httpStatus, body } = await callFetch(`${FIXTURES_BASE}/blocked`);
   assert.equal(body.status, 403);
