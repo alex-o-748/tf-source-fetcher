@@ -92,10 +92,18 @@ async function handleFetch(targetUrl, pageParamRaw, req, res) {
       host = targetUrl;
     }
 
-    // Politeness gate 1: our own per-host pacing/backoff, before we ever touch
-    // the network for this request.
+    // These gates are independent, so wait for them concurrently. Across
+    // requests Node already overlaps network I/O; this also avoids adding a
+    // cold robots lookup to time already spent in the per-host queue.
+    let allowed;
     try {
-      await hostLimiter.acquire(host, controller.signal);
+      [, allowed] = await Promise.all([
+        hostLimiter.acquire(host, controller.signal),
+        isAllowedByRobots(targetUrl, controller.signal).catch((error) => {
+          if (controller.signal.aborted) throw error;
+          return true;
+        }),
+      ]);
     } catch (e) {
       if (!(e instanceof RateLimitedError)) throw e;
       metrics.record({ rateLimited: true });
@@ -103,11 +111,6 @@ async function handleFetch(targetUrl, pageParamRaw, req, res) {
       return;
     }
 
-    // Politeness gate 2: robots.txt.
-    const allowed = await isAllowedByRobots(targetUrl, controller.signal).catch((error) => {
-      if (controller.signal.aborted) throw error;
-      return true;
-    });
     if (!allowed) {
       const body = { ...emptyContract(403, null), error: 'Blocked by robots.txt', cached: false };
       if (pageIsValidInt) {

@@ -166,8 +166,24 @@ part of the smallest runtime fix.
 There is no evidence in this service of an attempt/backoff loop: the only
 intentional wait is the per-host politeness queue (at most
 `HOST_MAX_QUEUE_WAIT_MS`), while a cold robots lookup has its own five-second
-cap but now also consumes the shared processing budget. On a warm host, the
-remaining stages are one upstream fetch/body download and one extraction.
+cap but now also consumes the shared processing budget. The queue wait and
+robots lookup are independent and run concurrently, so their latency is the
+maximum of the two rather than their sum. On a warm host, the remaining stages
+are one upstream fetch/body download and one extraction.
+
+Source requests are already parallel: Node accepts and advances multiple HTTP
+requests concurrently, and the batch caller controls the bounded source-level
+parallelism (currently four workers). There is therefore no serial source loop
+inside this service to replace with another pool. The per-host limiter only
+paces requests sharing a publisher host; requests to different hosts overlap.
+Within one request, connection/body download must precede extraction. HTML
+extraction is synchronous and deliberately is not run in a worker pool: the
+measured extraction peak is about 70 MB at the current parse cap, so four
+simultaneous extractors could exceed the pod's historical 256 MB heap limit.
+That would trade a modest latency improvement for restarts and much worse batch
+tails. If measurements show extraction—not network waits—dominates, a
+memory-sized worker pool is the next change to evaluate rather than unbounded
+parallel extraction.
 
 Do not select a lower production budget from the default alone. Compare
 candidate values (10 and 15 seconds are useful starting cohorts, not targets)
