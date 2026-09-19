@@ -77,9 +77,11 @@ function isPdf(targetUrl, contentType) {
 //
 // Every shape that got as far as reading a body also carries `bytes`, the
 // size of that body — reported to src/metrics.js and nothing else.
-async function fetchAndExtract(targetUrl, pageParam) {
+async function fetchAndExtract(targetUrl, pageParam, { signal } = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  const abort = () => controller.abort();
+  signal?.addEventListener('abort', abort, { once: true });
   let bytes = 0;
 
   let response;
@@ -94,6 +96,7 @@ async function fetchAndExtract(targetUrl, pageParam) {
     });
   } catch (e) {
     clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
     const reason =
       e.name === 'AbortError' ? 'Request to source timed out' : e.message || 'Network error';
     return { networkError: true, error: reason };
@@ -105,6 +108,7 @@ async function fetchAndExtract(targetUrl, pageParam) {
 
   if (!response.ok) {
     clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
     try {
       await response.body?.cancel();
     } catch {
@@ -124,6 +128,7 @@ async function fetchAndExtract(targetUrl, pageParam) {
     bytes = buf.byteLength;
   } catch (e) {
     clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
     if (e.code === 'TOO_LARGE') {
       return {
         ...emptyResultBase(response.status, fetchedAt),
@@ -132,65 +137,72 @@ async function fetchAndExtract(targetUrl, pageParam) {
     }
     return { networkError: true, error: e.message || 'Failed reading response body' };
   }
-  clearTimeout(timer);
-
-  if (pdf) {
-    let extracted;
-    try {
-      extracted = await extractPdf(buf, pageParam);
-    } catch (e) {
-      if (e instanceof InvalidPageError) {
-        return {
-          invalidPage: true,
-          error: e.message,
-          status: response.status,
-          totalPages: e.totalPages,
-          fetchedAt,
-          bytes,
-        };
+  try {
+    if (pdf) {
+      let extracted;
+      try {
+        extracted = await extractPdf(buf, pageParam, { signal: controller.signal });
+      } catch (e) {
+        if (e instanceof InvalidPageError) {
+          return {
+            invalidPage: true,
+            error: e.message,
+            status: response.status,
+            totalPages: e.totalPages,
+            fetchedAt,
+            bytes,
+          };
+        }
+        // Corrupt/unparseable PDF: we got a response, just nothing usable.
+        return { ...emptyResultBase(response.status, fetchedAt), error: NO_CONTENT_ERROR, bytes };
       }
-      // Corrupt/unparseable PDF: we got a response, just nothing usable.
-      return { ...emptyResultBase(response.status, fetchedAt), error: NO_CONTENT_ERROR, bytes };
+
+      if (extracted.content.length < MIN_CONTENT_CHARS) {
+        return { ...emptyResultBase(response.status, fetchedAt), error: NO_CONTENT_ERROR, bytes };
+      }
+
+      return {
+        content: extracted.content,
+        error: null,
+        status: response.status,
+        pdf: true,
+        totalPages: extracted.totalPages,
+        page: extracted.page,
+        truncated: extracted.truncated,
+        fetchedAt,
+        bytes,
+      };
     }
 
-    if (extracted.content.length < MIN_CONTENT_CHARS) {
-      return { ...emptyResultBase(response.status, fetchedAt), error: NO_CONTENT_ERROR, bytes };
+    const html = buf.toString('utf8');
+    const extracted = extractHtml(html, targetUrl);
+
+    // bodyChars, not content.length: content carries a Title/Published/By
+    // header, and a login wall with a long headline and byline would otherwise
+    // clear this floor on metadata alone and be reported as usable content.
+    if (extracted.bodyChars < MIN_CONTENT_CHARS) {
+      return {
+        ...emptyResultBase(response.status, fetchedAt),
+        error: NO_CONTENT_ERROR,
+        bytes,
+      };
     }
 
     return {
       content: extracted.content,
       error: null,
       status: response.status,
-      pdf: true,
-      totalPages: extracted.totalPages,
-      page: extracted.page,
+      pdf: false,
+      totalPages: null,
+      page: null,
       truncated: extracted.truncated,
       fetchedAt,
       bytes,
     };
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
   }
-
-  const html = buf.toString('utf8');
-  const extracted = extractHtml(html, targetUrl);
-
-  // bodyChars, not content.length: content carries a Title/Published/By
-  // header, and a login wall with a long headline and byline would otherwise
-  // clear this floor on metadata alone and be reported as usable content.
-  if (extracted.bodyChars < MIN_CONTENT_CHARS) {
-    return { ...emptyResultBase(response.status, fetchedAt), error: NO_CONTENT_ERROR, bytes };
-  }
-
-  return {
-    content: extracted.content,
-    error: null,
-    status: response.status,
-    pdf: false,
-    totalPages: null,
-    page: null,
-    truncated: extracted.truncated,
-    fetchedAt,
-    bytes,
-  };
 }
 
 module.exports = { fetchAndExtract, isPdf };
