@@ -19,8 +19,11 @@ module.exports = {
   // The client (core/worker.js) discards content.length <= 100 as unverifiable.
   MIN_CONTENT_CHARS: 101,
 
-  // Network fetch of the upstream page/PDF, including reading the body.
-  FETCH_TIMEOUT_MS: Number(process.env.FETCH_TIMEOUT_MS) || 20000,
+  // One wall-clock budget for a cache miss: host queueing, robots lookup,
+  // upstream connection/body download and extraction all share it. Keep the
+  // old envvar as a compatibility fallback for existing deployments.
+  PROCESSING_DEADLINE_MS:
+    Number(process.env.PROCESSING_DEADLINE_MS || process.env.FETCH_TIMEOUT_MS) || 20000,
 
   // robots.txt lookups should be quick; a slow/hanging robots.txt shouldn't
   // block the actual fetch for long.

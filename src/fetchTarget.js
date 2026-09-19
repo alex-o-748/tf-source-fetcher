@@ -4,7 +4,6 @@ const { extractHtml } = require('./extractHtml');
 const { extractPdf, InvalidPageError } = require('./extractPdf');
 const {
   USER_AGENT,
-  FETCH_TIMEOUT_MS,
   MAX_HTML_BYTES,
   MAX_PDF_BYTES,
   MIN_CONTENT_CHARS,
@@ -77,15 +76,13 @@ function isPdf(targetUrl, contentType) {
 //
 // Every shape that got as far as reading a body also carries `bytes`, the
 // size of that body — reported to src/metrics.js and nothing else.
-async function fetchAndExtract(targetUrl, pageParam) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+async function fetchAndExtract(targetUrl, pageParam, signal) {
   let bytes = 0;
 
   let response;
   try {
     response = await fetch(targetUrl, {
-      signal: controller.signal,
+      signal,
       redirect: 'follow',
       headers: {
         'User-Agent': USER_AGENT,
@@ -93,9 +90,10 @@ async function fetchAndExtract(targetUrl, pageParam) {
       },
     });
   } catch (e) {
-    clearTimeout(timer);
     const reason =
-      e.name === 'AbortError' ? 'Request to source timed out' : e.message || 'Network error';
+      e.name === 'AbortError' || signal?.aborted
+        ? 'Source processing timed out (deadline exceeded)'
+        : e.message || 'Network error';
     return { networkError: true, error: reason };
   }
 
@@ -104,7 +102,6 @@ async function fetchAndExtract(targetUrl, pageParam) {
   const pdf = isPdf(targetUrl, contentType);
 
   if (!response.ok) {
-    clearTimeout(timer);
     try {
       await response.body?.cancel();
     } catch {
@@ -123,7 +120,6 @@ async function fetchAndExtract(targetUrl, pageParam) {
     // than requests served is a different bug from one that tracks either.
     bytes = buf.byteLength;
   } catch (e) {
-    clearTimeout(timer);
     if (e.code === 'TOO_LARGE') {
       return {
         ...emptyResultBase(response.status, fetchedAt),
@@ -132,7 +128,10 @@ async function fetchAndExtract(targetUrl, pageParam) {
     }
     return { networkError: true, error: e.message || 'Failed reading response body' };
   }
-  clearTimeout(timer);
+
+  if (signal?.aborted) {
+    return { networkError: true, error: 'Source processing timed out (deadline exceeded)' };
+  }
 
   if (pdf) {
     let extracted;
@@ -151,6 +150,10 @@ async function fetchAndExtract(targetUrl, pageParam) {
       }
       // Corrupt/unparseable PDF: we got a response, just nothing usable.
       return { ...emptyResultBase(response.status, fetchedAt), error: NO_CONTENT_ERROR, bytes };
+    }
+
+    if (signal?.aborted) {
+      return { networkError: true, error: 'Source processing timed out (deadline exceeded)' };
     }
 
     if (extracted.content.length < MIN_CONTENT_CHARS) {
@@ -172,6 +175,10 @@ async function fetchAndExtract(targetUrl, pageParam) {
 
   const html = buf.toString('utf8');
   const extracted = extractHtml(html, targetUrl);
+
+  if (signal?.aborted) {
+    return { networkError: true, error: 'Source processing timed out (deadline exceeded)' };
+  }
 
   // bodyChars, not content.length: content carries a Title/Published/By
   // header, and a login wall with a long headline and byline would otherwise

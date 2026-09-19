@@ -13,8 +13,20 @@ class RateLimitedError extends Error {
   }
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(done, ms);
+    function done() {
+      signal?.removeEventListener('abort', aborted);
+      resolve();
+    }
+    function aborted() {
+      clearTimeout(timer);
+      reject(signal.reason || new DOMException('Aborted', 'AbortError'));
+    }
+    if (signal?.aborted) aborted();
+    else signal?.addEventListener('abort', aborted, { once: true });
+  });
 }
 
 // Best-effort, in-process per-host politeness control: a minimum gap between
@@ -37,7 +49,7 @@ class HostRateLimiter {
 
   // Resolves once it's this host's turn, or throws RateLimitedError if the
   // wait would exceed the configured budget.
-  async acquire(host) {
+  async acquire(host, signal) {
     const now = Date.now();
 
     const backoff = this.backoffUntil.get(host);
@@ -59,7 +71,7 @@ class HostRateLimiter {
     this.nextAvailableAt.set(host, Math.max(nextFree, now) + HOST_MIN_INTERVAL_MS);
 
     if (wait > 0) {
-      await sleep(wait);
+      await sleep(wait, signal);
     }
   }
 

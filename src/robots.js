@@ -6,6 +6,26 @@ const { USER_AGENT, ROBOTS_TIMEOUT_MS, ROBOTS_CACHE_TTL_MS } = require('./config
 // host -> { parser, expiresAt }
 const cache = new Map();
 
+function waitForSharedLookup(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(signal.reason);
+
+  return new Promise((resolve, reject) => {
+    const aborted = () => reject(signal.reason);
+    signal.addEventListener('abort', aborted, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener('abort', aborted);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener('abort', aborted);
+        reject(error);
+      }
+    );
+  });
+}
+
 async function fetchRobotsTxt(origin) {
   const robotsUrl = `${origin}/robots.txt`;
   const controller = new AbortController();
@@ -33,7 +53,7 @@ async function fetchRobotsTxt(origin) {
 
 // Returns true if `targetUrl` may be fetched per its host's robots.txt.
 // Results are cached per host for ROBOTS_CACHE_TTL_MS.
-async function isAllowedByRobots(targetUrl) {
+async function isAllowedByRobots(targetUrl, signal) {
   const parsed = new URL(targetUrl);
   const origin = parsed.origin;
 
@@ -44,7 +64,9 @@ async function isAllowedByRobots(targetUrl) {
     cache.set(origin, entry);
   }
 
-  const parser = await entry.parserPromise;
+  // The lookup is shared by all concurrent requests for this origin. Abort
+  // this caller's wait without cancelling (and poisoning) the shared lookup.
+  const parser = await waitForSharedLookup(entry.parserPromise, signal);
   const allowed = parser.isAllowed(targetUrl, USER_AGENT);
   // robots-parser returns undefined when a rule can't be determined; treat
   // that as allowed rather than blocking on ambiguity.
