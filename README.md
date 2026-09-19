@@ -127,7 +127,10 @@ status if that field is missing, so either way is safe to depend on.
   see [Publication metadata](#publication-metadata) for why that is load-bearing.
 - PDF extraction uses [`unpdf`](https://github.com/unjs/unpdf), the same
   library the Worker uses, including per-page extraction when `page` is
-  given.
+  given. Every PDF document is explicitly cleaned up and its loading task is
+  destroyed after success, invalid-page errors, parser errors, timeouts, and
+  client disconnects; this releases PDF.js page/operator/font caches and
+  worker resources.
 - The 100,000-character truncation cutoff matches the Worker's
   `.substring(0, 100000)` exactly.
 
@@ -207,6 +210,12 @@ serving pages the download cap allows:
 ```
 
 Every one of those pages still returns the full 100,000 characters of content.
+
+Run `npm run test:memory` for the mixed HTML/PDF retained-memory regression.
+It performs 1,000 extractions (20% PDFs), forces collection at 50-request
+sample boundaries, prints RSS, heap used/total, external and ArrayBuffer
+memory, request/PDF counts and retained heap per request as JSON, and fails if
+the second-half heap slope is not bounded.
 
 So `prepareMarkup()` bounds what either extraction path is allowed to see:
 scripts, stylesheets and comments are dropped first — pure weight for a text

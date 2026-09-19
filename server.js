@@ -59,7 +59,7 @@ function isSuccessStatus(status) {
   return typeof status === 'number' && status >= 200 && status < 300;
 }
 
-async function handleFetch(targetUrl, pageParamRaw, res) {
+async function handleFetch(targetUrl, pageParamRaw, res, signal) {
   const pageNum = pageParamRaw !== null ? parseInt(pageParamRaw, 10) : null;
   const pageIsValidInt = pageParamRaw === null || Number.isInteger(pageNum);
   const cacheKeyPage = Number.isInteger(pageNum) ? pageNum : null;
@@ -101,7 +101,7 @@ async function handleFetch(targetUrl, pageParamRaw, res) {
     return;
   }
 
-  const result = await fetchAndExtract(targetUrl, pageParamRaw);
+  const result = await fetchAndExtract(targetUrl, pageParamRaw, { signal });
 
   if (result.networkError) {
     // Never reached upstream at all — status stays null per contract, and
@@ -207,8 +207,12 @@ const server = http.createServer((req, res) => {
   }
 
   const pageParamRaw = url.searchParams.get('page');
+  const requestController = new AbortController();
+  const abortRequest = () => requestController.abort();
+  req.once('aborted', abortRequest);
+  res.once('close', abortRequest);
 
-  handleFetch(targetUrl, pageParamRaw, res)
+  handleFetch(targetUrl, pageParamRaw, res, requestController.signal)
     .catch((err) => {
       console.error('[server] unhandled error handling', targetUrl, err);
       metrics.record({ networkError: true });
@@ -226,7 +230,11 @@ const server = http.createServer((req, res) => {
     })
     // One place, so every exit path above is counted exactly once and the
     // periodic line can't be skipped by whichever branch returned.
-    .finally(() => metrics.maybeLog());
+    .finally(() => {
+      req.removeListener('aborted', abortRequest);
+      res.removeListener('close', abortRequest);
+      metrics.maybeLog();
+    });
 });
 
 async function main() {
