@@ -279,6 +279,41 @@ Reading it:
 | `bytes` | what we read, not how often | buffers and extracted strings |
 | `rtxt` | what we read *and kept* per origin | `robots.js` — and note `bytes` never counted this |
 
+`net[...]` attributes the `net=` count, printed only when something failed:
+
+```
+net[timeout:41/dns:12/reset:6/tls:2/internal:1]
+```
+
+| Category | Means | Whose problem |
+|---|---|---|
+| `timeout` | our 20 s `FETCH_TIMEOUT_MS`, or undici's connect/headers timeout | the publisher is slow, or we are — see below |
+| `dns` | `ENOTFOUND` / `EAI_AGAIN` | the URL: permanent, retrying is waste |
+| `refused` / `reset` | `ECONNREFUSED`, `ECONNRESET`, socket hang up | transient, worth a retry |
+| `tls` | expired/invalid certificate, handshake failure | the publisher's, permanent until they fix it |
+| `protocol` | malformed HTTP from the other end | the publisher's |
+| `body` | the download died part-way, after headers were fine | transient |
+| `internal` | **an unhandled exception in this process** | ours |
+
+Node's `fetch` reports nearly everything as `TypeError: fetch failed` and hides
+the real reason in `err.cause.code`, which is why one counter could not tell a
+dead host from our own bug. Anything unrecognized lands in `other`, and its raw
+code is kept (capped at 20 distinct ones) in `/metrics`'s `unknownNetCodes` so
+the category list can be widened from evidence.
+
+**`timeout` deserves suspicion before the publisher does.** Under heap
+pressure this service produced a 57% failure rate that was mostly its own
+(see cause 4 below); a process spending long stretches in mark-compact misses
+a 20 s deadline. A `timeout` share that rises with heap is us, not them.
+
+**The `error` string is deliberately not changed by any of this.** The client
+(`citation-checker-script`'s `core/worker.js`) decides whether to retry by
+matching the wording — `/^(?:fetch failed|terminated)$/` is its own transport
+failure and retryable, `Request to source timed out` is deliberately not.
+Replacing `fetch failed` with `getaddrinfo ENOTFOUND example.com` would turn
+every retryable transport failure into a permanent `SOURCE UNAVAILABLE` row.
+`test/networkErrors.test.js` pins that.
+
 Two fields deserve their own note, because the first production reading of
 this line was misread without them.
 
@@ -307,7 +342,10 @@ This is scaffolding, not a feature. Once the growth is identified and fixed,
 deleting `src/metrics.js`, `test/metrics.test.js`, the `MEM_LOG_EVERY` entry
 in `src/config.js`, the `bytes` field in `src/fetchTarget.js`, the
 `recordRobotsFetch()` call in `src/robots.js` and the calls in `server.js`
-should leave no trace. The *ceilings* below are not scaffolding and stay.
+should leave no trace. `classifyNetworkError()` in `src/fetchTarget.js` is
+**not** scaffolding — it is the only thing separating "the publisher is
+unreachable" from "we threw an exception" — and neither are the ceilings
+below. The *ceilings* below are not scaffolding and stay.
 
 If a heap snapshot is wanted instead, `NODE_OPTIONS=--heapsnapshot-near-heap-limit=1`
 as a Toolforge envvar makes the next OOM dump one — but it writes a file about
@@ -346,12 +384,16 @@ wait, an expired backoff blocks nothing. Dropping those costs nothing at all,
 and it is what keeps the Maps at the *working* set (hosts seen in the last
 second, or backed off in the last 30) instead of every host ever seen.
 
-**This is a bound, not yet a diagnosis.** It removes a structure that was
-provably growing without limit and makes the `[mem]` line's `rtxt` / `rKB` /
-`rEvict` fields say how much it was actually holding. If the heap curve goes
-flat, that was it; if it doesn't, the same line now points at undici's
-per-origin pools or at something per-request, with one hypothesis eliminated
-rather than assumed.
+**It was a bound, not the diagnosis — measured, not assumed.** The ceilings
+went in as the leading hypothesis and production disproved them: over 350
+requests across 65 origins, `rtxt` totalled **0.6 MB** and `rEvict` stayed at
+**0**. One publisher does ship a 384 KB `robots.txt` (visible as `rKB` jumping
+181 -> 565 in a single interval), so the ceilings are not pointless, but this
+was never the leak. Cause 4 below is.
+
+Keeping this section is the point: a structure that grows once per origin and
+evicts nothing is a real defect at sweep scale whether or not it was *this*
+crash, and the fields that ruled it out only exist because it was suspected.
 
 ### 4. Retention: the shared parser kept every document it made
 
@@ -404,6 +446,39 @@ measuring test that parses *without* Readability, over a deliberately
 node-dense fixture. All three fail against the unreleased shared parser — the
 measuring one at 23.5 MB/page — and the pre-existing `extractHtml` test passes
 against it, which is exactly the point.
+
+**Confirmed in production**, same pod spec, same sweep, `MEM_LOG_EVERY=10`:
+
+| | Before (`b207ae3`) | After (`35b8219`) |
+|---|---|---|
+| Requests observed | 180 | 350 |
+| Successful extractions | 67 | 253 |
+| Heap, first sample -> last | 43.0 -> **245.5 MB** | 47.2 -> **67.2 MB** |
+| Retained per extraction | **+3.02 MB** | **+0.08 MB** |
+| Peak heap | 245.5 (ceiling ~254) | 114.7 |
+| RSS, first -> last | 133 -> 400 MB | 147 -> 289 MB |
+
+The post-GC floors now oscillate in a 58-115 MB band with no trend, instead of
+ratcheting 102 -> 158 -> 177 -> 189 -> 211 -> 245. The after run served nearly
+twice as many requests as the before run managed and ended at a quarter of the
+heap.
+
+**The fetch failure rate fell with it**, which was not expected and is worth
+knowing before anyone investigates upstreams again:
+
+| | Before | After |
+|---|---|---|
+| `ok` | 67/180 = **37%** | 253/350 = **72%** |
+| `net` | 103/180 = **57%** | 62/350 = **18%** |
+
+More telling than the rate: in the after run `net` sat at exactly 50 for 160
+consecutive requests — zero network failures across that whole stretch — with
+the failures clustered at the start. A heap near its ceiling spends long
+stretches in mark-compact, and a 20 s fetch timeout does not survive many of
+those; a crash-looping pod 502s everything in flight besides. The two runs hit
+different URL mixes so this is not a controlled comparison, but "the sources
+are failing" was substantially this service failing. Re-measure upstream
+reliability from the after numbers, not the before ones.
 
 ### Reproducing it locally: `npm run fixtures` && `npm run leak`
 

@@ -113,7 +113,11 @@ async function handleFetch(targetUrl, pageParamRaw, res, signal) {
   if (result.networkError) {
     // Never reached upstream at all — status stays null per contract, and
     // this is transient by nature so it's never cached.
-    metrics.record({ networkError: true });
+    metrics.record({
+      networkError: true,
+      netCategory: result.netCategory,
+      netCode: result.netCode,
+    });
     sendJson(res, 502, { ...emptyContract(null, null), error: result.error, cached: false });
     return;
   }
@@ -222,7 +226,10 @@ const server = http.createServer((req, res) => {
   handleFetch(targetUrl, pageParamRaw, res, requestController.signal)
     .catch((err) => {
       console.error('[server] unhandled error handling', targetUrl, err);
-      metrics.record({ networkError: true });
+      // Categorised `internal`, not left in the same bucket as an unreachable
+      // publisher: this is a bug in this process, and counting it as a network
+      // failure is how it stays invisible.
+      metrics.record({ networkError: true, netCategory: 'internal' });
       sendJson(res, 500, {
         content: null,
         error: 'Internal error',

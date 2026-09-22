@@ -76,6 +76,32 @@ let robotsFetches = 0;
 let robotsBytes = 0;
 let robotsMaxBytes = 0;
 
+// `networkError` used to be one number covering four unrelated failures — a
+// host that does not resolve, a certificate we reject, a publisher too slow
+// for the 20 s timeout, and an unhandled exception in this process. After the
+// retention fix the rate fell from 57% to 18%, which makes the remainder worth
+// attributing rather than dismissing: a dns failure is the URL's fault and
+// permanent, a reset is worth retrying, and `internal` is our bug. Fixed
+// category set, so this cannot grow.
+const netCategories = {
+  timeout: 0,
+  dns: 0,
+  refused: 0,
+  reset: 0,
+  tls: 0,
+  protocol: 0,
+  url: 0,
+  body: 0,
+  internal: 0,
+  other: 0,
+};
+
+// The raw codes behind `other`, so widening NET_CATEGORIES is evidence-driven.
+// Bounded: codes come from a small finite set, and the cap makes that a
+// guarantee rather than an assumption.
+const UNKNOWN_CODE_CAP = 20;
+const unknownNetCodes = new Set();
+
 let gauges = () => ({});
 
 // Baseline for the per-interval deltas, reset each time a line is emitted.
@@ -112,6 +138,13 @@ function record(event = {}) {
   if (typeof event.bytes === 'number' && event.bytes > 0) {
     bytesFetched += event.bytes;
   }
+  if (event.networkError) {
+    const category = Object.hasOwn(netCategories, event.netCategory) ? event.netCategory : 'other';
+    netCategories[category] += 1;
+    if (category === 'other' && event.netCode && unknownNetCodes.size < UNKNOWN_CODE_CAP) {
+      unknownNetCodes.add(String(event.netCode));
+    }
+  }
 }
 
 // One robots.txt read. `bytes` is 0 for a miss, a failure or a timeout — all
@@ -132,6 +165,8 @@ function snapshot() {
     counts: { ...counts },
     bytesFetched,
     robots: { fetches: robotsFetches, bytes: robotsBytes, maxBytes: robotsMaxBytes },
+    netCategories: { ...netCategories },
+    unknownNetCodes: [...unknownNetCodes],
     memory: {
       rss: m.rss,
       heapUsed: m.heapUsed,
@@ -169,12 +204,21 @@ function formatLine() {
     .map(([k, v]) => `${k}:${v}`)
     .join('/');
 
+  // Only the categories that have fired, so a clean run does not print ten
+  // zeroes and a bad one is impossible to miss.
+  const netBreakdown = Object.entries(s.netCategories)
+    .filter(([, v]) => v > 0)
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, v]) => `${k}:${v}`)
+    .join('/');
+
   const perReq = dReq > 0 ? mb(dHeap) / dReq : 0;
 
   return (
     `[mem] req=${s.counts.requests} (+${dReq} in ${dSeconds}s) ` +
     `ok=${s.counts.ok} http=${s.counts.httpError} net=${s.counts.networkError} ` +
     `robots=${s.counts.robotsBlocked} rl=${s.counts.rateLimited} ` +
+    (netBreakdown ? `net[${netBreakdown}] ` : '') +
     `cached=${s.counts.cached} nocontent=${s.counts.noContent} pdf=${s.counts.pdf} ` +
     `bytes=${mb(s.bytesFetched).toFixed(1)}MB (+${mb(dBytes).toFixed(1)}MB) ` +
     // `rtxt`, not `robots` — the existing `robots=` field is the count of
@@ -217,6 +261,8 @@ function resetForTest() {
   robotsFetches = 0;
   robotsBytes = 0;
   robotsMaxBytes = 0;
+  for (const key of Object.keys(netCategories)) netCategories[key] = 0;
+  unknownNetCodes.clear();
   gauges = () => ({});
   resetMark();
 }
