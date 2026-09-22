@@ -27,6 +27,21 @@ module.exports = {
   ROBOTS_TIMEOUT_MS: Number(process.env.ROBOTS_TIMEOUT_MS) || 5000,
   ROBOTS_CACHE_TTL_MS: Number(process.env.ROBOTS_CACHE_TTL_MS) || 60 * 60 * 1000,
 
+  // Ceilings on the parsed-robots.txt cache. A citation sweep sees close to one
+  // new origin per request and this Map evicted nothing, so it was a retention
+  // that grew for the life of the process — and an entry is not small:
+  // publishers ship robots.txt at hundreds of KB, which robots-parser turns
+  // into a rule object per line.
+  //
+  // Both ceilings are needed. The count alone does not bound memory (500 fat
+  // files is not the same as 500 thin ones); the byte budget alone would let
+  // one process hold tens of thousands of tiny entries. BYTES counts the
+  // *source* text, which is a proxy for the parsed form, not a measurement of
+  // it — the parsed objects are some multiple of it. Sized to stay small
+  // against a 256 MB heap even if that multiple is 10x.
+  ROBOTS_CACHE_MAX: Number(process.env.ROBOTS_CACHE_MAX) || 500,
+  ROBOTS_CACHE_MAX_BYTES: Number(process.env.ROBOTS_CACHE_MAX_BYTES) || 8 * 1024 * 1024,
+
   // Response body size guards. Toolforge gives this tool a heavier memory
   // budget than the other two tools specifically for PDF parsing / large
   // buffers, so these are a bit more generous than the Worker's 10 MB PDF cap.
@@ -56,6 +71,14 @@ module.exports = {
   HOST_MAX_QUEUE_WAIT_MS: Number(process.env.HOST_MAX_QUEUE_WAIT_MS) || 8000,
   // How long to back a host off after it returns a 429 to us.
   HOST_BACKOFF_MS: Number(process.env.HOST_BACKOFF_MS) || 30000,
+
+  // Ceiling on the rate limiter's per-host Maps. Almost never reached: an
+  // entry stops meaning anything once its timestamp passes, and the limiter
+  // sweeps those, so the live set is "hosts with a reservation in the next
+  // second or a backoff in the last 30" — tens, not thousands. This is the
+  // backstop for the pathological case, and it is deliberately well above the
+  // working set so that hitting it is a signal something else is wrong.
+  HOST_STATE_MAX: Number(process.env.HOST_STATE_MAX) || 5000,
 
   // Diagnostic scaffolding: emit a `[mem]` line every N requests with process
   // memory, counters and the size of the per-origin caches. 0 disables the

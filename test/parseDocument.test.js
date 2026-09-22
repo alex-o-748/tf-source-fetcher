@@ -22,6 +22,7 @@ const vm = require('node:vm');
 const {
   prepareMarkup,
   parseDocument,
+  releaseDocument,
   windowsCreatedForTest,
 } = require('../src/parseDocument');
 const { extractHtml } = require('../src/extractHtml');
@@ -301,6 +302,107 @@ test(
       `retained ${perPage.toFixed(3)} MB/page over ${PAGES} pages ` +
         `(${before.toFixed(1)} -> ${after.toFixed(1)} MB); budget is ${MAX_MB_PER_PAGE} MB/page. ` +
         'A per-page jsdom Window is the usual cause — see src/parseDocument.js.'
+    );
+  }
+);
+
+// --- RETENTION: the shared parser keeps every document it makes -----------
+//
+// The third cause, found after the first two were fixed and the pod kept
+// dying. A document parsed by the shared DOMParser stays reachable from the
+// Window that owns the parser, and that Window lives for the life of the
+// process. Measured against real-shaped pages: 10.83 MB retained per page,
+// against 0.60 for the per-page `new JSDOM()` the shared parser replaced.
+//
+// The retained-per-page test above did not catch it, and the reason is worth
+// keeping in mind before trusting any of these: it measures `extractHtml`,
+// and Readability strips the document it is handed down to the article. A
+// page that reaches Readability leaves a husk behind. The pages that retain
+// in full are the ones that skip it — JS shells, non-article pages, anything
+// taking the regex fallback — and in production those are most of them.
+
+test('parsing a second document releases the first', () => {
+  const first = parseDocument(prepareMarkup(newsPage(1)).markup, URL_N(1));
+  assert.ok(first.childNodes.length > 0, 'precondition: the document has content');
+
+  parseDocument(prepareMarkup(newsPage(2)).markup, URL_N(2));
+
+  assert.equal(
+    first.childNodes.length,
+    0,
+    'the previous document must be emptied, or every page ever parsed is retained'
+  );
+});
+
+test('releaseDocument empties a document immediately', () => {
+  const doc = parseDocument(prepareMarkup(newsPage(3)).markup, URL_N(3));
+  assert.ok(doc.childNodes.length > 0);
+
+  releaseDocument(doc);
+
+  assert.equal(doc.childNodes.length, 0);
+  // Releasing twice, or releasing something that was never parsed, must not
+  // throw: it runs in a `finally` on the request path.
+  assert.doesNotThrow(() => releaseDocument(doc));
+  assert.doesNotThrow(() => releaseDocument(null));
+});
+
+test('the parser still works normally after a release', () => {
+  const doc = parseDocument(prepareMarkup(newsPage(4)).markup, URL_N(4));
+  releaseDocument(doc);
+  const next = parseDocument(prepareMarkup(newsPage(5)).markup, URL_N(5));
+  assert.match(next.title, /Council approves measure 5/);
+  assert.equal(next.querySelectorAll('p').length, 60);
+});
+
+// The measuring version, over the path Readability does NOT clean up for us.
+// This is the test that fails against the unreleased shared parser; the
+// extractHtml one above passes against it.
+// Deliberately node-dense rather than byte-dense. Retention here is per DOM
+// node, not per byte, and `newsPage` — 60 paragraphs — is small enough that
+// retaining every copy stays inside the budget. That is the same blind spot
+// that made the 3 KB fixture in scripts/load-memory.js report this service as
+// leak-free while production died: a fixture can be wrong by being *simple*,
+// not just by being small.
+function densePage(n) {
+  const rows = Array.from(
+    { length: 900 },
+    (_, i) =>
+      `<div class="wrap w${i}" data-idx="${i}"><div class="inner"><p id="p${n}-${i}" ` +
+      `class="text" data-para="${i}">Paragraph ${i} of ${n}. ` +
+      'The council approved the measure after a lengthy debate. '.repeat(3) +
+      `<span class="hl">note</span> <a href="/l/${i}">link</a></p></div></div>`
+  ).join('');
+  return `<!DOCTYPE html><html lang="en"><head><title>Dense ${n}</title></head>` +
+    `<body><article>${rows}</article></body></html>`;
+}
+
+test(
+  'parsing without Readability does not retain memory per page',
+  { skip: gc ? false : 'could not obtain a GC; run with --expose-gc to measure' },
+  () => {
+    const heapMB = () => {
+      gc();
+      gc();
+      return process.memoryUsage().heapUsed / 1024 / 1024;
+    };
+
+    const DENSE_PAGES = 40;
+    for (let i = 0; i < 5; i++) parseDocument(prepareMarkup(densePage(i)).markup, URL_N(i));
+
+    const before = heapMB();
+    for (let i = 0; i < DENSE_PAGES; i++) {
+      const doc = parseDocument(prepareMarkup(densePage(i)).markup, URL_N(i));
+      releaseDocument(doc);
+    }
+    const after = heapMB();
+
+    const perPage = (after - before) / DENSE_PAGES;
+    assert.ok(
+      perPage < MAX_MB_PER_PAGE,
+      `retained ${perPage.toFixed(3)} MB/page over ${DENSE_PAGES} parses ` +
+        `(${before.toFixed(1)} -> ${after.toFixed(1)} MB); budget is ${MAX_MB_PER_PAGE} MB/page. ` +
+        'The shared parser holds every document it makes — see releaseDocument().'
     );
   }
 );

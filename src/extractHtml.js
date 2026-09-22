@@ -1,7 +1,7 @@
 'use strict';
 
 const { Readability, isProbablyReaderable } = require('@mozilla/readability');
-const { prepareMarkup, parseDocument } = require('./parseDocument');
+const { prepareMarkup, parseDocument, releaseDocument } = require('./parseDocument');
 const { MAX_CONTENT_CHARS } = require('./config');
 
 // Below this, Readability's output is short enough to be suspicious rather
@@ -213,12 +213,13 @@ function extractHtml(html, url) {
 
   let readabilityText = '';
   let header = '';
+  let doc = null;
 
   try {
     // parseDocument, not `new JSDOM(markup, { url })`: the latter builds a
     // Window per page, ~1.8 MB of garbage that only a full mark-compact
     // retires, on a heap this service was already driving to its ceiling.
-    const doc = parseDocument(markup, url);
+    doc = parseDocument(markup, url);
     if (isProbablyReaderable(doc)) {
       // Both of these must be read before parse(): Readability mutates the
       // document it is handed, removing the very nodes they look at.
@@ -243,6 +244,14 @@ function extractHtml(html, url) {
     // constructs) — fall through to the regex extractor below.
     readabilityText = '';
     header = '';
+  } finally {
+    // Everything taken out of `doc` above is a string by now, and the document
+    // is reachable from the shared parser's Window until it is emptied. In a
+    // `finally` because the paths that DON'T reach Readability are exactly the
+    // expensive ones: Readability strips the document it processes, so a page
+    // that throws, or is judged not readerable, is the one that would retain
+    // its full ~10 MB. See releaseDocument() in src/parseDocument.js.
+    releaseDocument(doc);
   }
 
   // Under-selection guard. The existing fallback only fires when Readability

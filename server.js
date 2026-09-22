@@ -4,7 +4,7 @@ const http = require('http');
 
 const config = require('./src/config');
 const cache = require('./src/cache');
-const { isAllowedByRobots, robotsCacheSize } = require('./src/robots');
+const { isAllowedByRobots, robotsCacheStats } = require('./src/robots');
 const { HostRateLimiter, RateLimitedError } = require('./src/rateLimiter');
 const { fetchAndExtract } = require('./src/fetchTarget');
 const metrics = require('./src/metrics');
@@ -12,13 +12,20 @@ const metrics = require('./src/metrics');
 const hostLimiter = new HostRateLimiter();
 
 // Diagnostic scaffolding — see the header of src/metrics.js. These are the
-// two structures in this process that grow once per distinct origin and are
-// never evicted, which is the leading hypothesis for the heap growth that
-// outlived the parse-budget fix.
-metrics.setGauges(() => ({
-  robots: robotsCacheSize(),
-  limiter: hostLimiter.size(),
-}));
+// two structures in this process that grow once per distinct origin, which is
+// the leading hypothesis for the heap growth that outlived the parse-budget
+// fix. Both are now bounded, so the numbers to read together are the size and
+// `rEvict`: a size parked at its ceiling with evictions climbing means the cap
+// is the only thing holding this down, and that it was genuinely growing.
+metrics.setGauges(() => {
+  const robots = robotsCacheStats();
+  return {
+    robots: robots.entries,
+    rKB: Math.round(robots.bytes / 1024),
+    rEvict: robots.evictions,
+    limiter: hostLimiter.size(),
+  };
+});
 
 function emptyContract(status, fetchedAt) {
   return {

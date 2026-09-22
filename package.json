@@ -11,7 +11,9 @@
     "start": "node server.js",
     "test": "node --test test/*.test.js",
     "test:unit": "node --test test/extractHtml.test.js test/extractPdf.test.js test/parseDocument.test.js",
-    "test:memory": "node --expose-gc scripts/load-memory.js 1000"
+    "test:memory": "node --expose-gc scripts/load-memory.js 1000",
+    "fixtures": "node scripts/capture-fixtures.js",
+    "leak": "node --expose-gc scripts/leak-hunt.js"
   },
   "repository": {
     "type": "git",

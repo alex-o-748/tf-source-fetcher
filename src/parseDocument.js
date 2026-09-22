@@ -45,7 +45,14 @@ const { MAX_PARSE_BYTES } = require('./config');
 //    ceiling by (1). `parseDocument()` builds exactly one Window for the life
 //    of the process and parses every page into a fresh, window-less Document
 //    with its DOMParser — the same Document type a browser hands Readability.
-//    Measured 0.006 MB/page retained against 1.76, and ~2x faster per page.
+//    It is ~2x faster per page.
+//
+//    That change also introduced a much larger leak of its own, because a
+//    document parsed by the shared parser stays reachable from the Window that
+//    owns it, and that Window never goes away. The "0.006 MB/page retained"
+//    this comment used to claim was measured against a 3 KB synthetic fixture;
+//    against real pages it is 10.83 MB/page. See releaseDocument() below,
+//    which is what makes the shared parser safe rather than merely fast.
 //
 // `JSDOM.fragment()` — the fix citation-checker-script's batch pipeline used
 // for the same jsdom cost — is not available here: it returns a
@@ -98,6 +105,10 @@ function prepareMarkup(html) {
 let sharedParser = null;
 let windowsCreated = 0;
 
+// The document the shared parser produced last, held only so the next parse
+// can empty it. See releaseDocument().
+let lastDocument = null;
+
 function parser() {
   if (sharedParser) return sharedParser;
 
@@ -131,6 +142,44 @@ function applyBaseUrl(doc, url) {
   doc.head.insertBefore(base, doc.head.firstChild);
 }
 
+// Empties a document produced by parseDocument, so the nodes it holds can be
+// collected while the shared parser stays alive.
+//
+// THIS IS NOT OPTIONAL TIDYING. A document parsed by the shared DOMParser
+// stays reachable from the Window that owns the parser, and that Window lives
+// for the life of the process — so without this, every page ever parsed is
+// retained. Measured over real-shaped pages (~160 KB), retained heap per page:
+//
+//   shared parser, as it was                     10.83 MB   <- the leak
+//   shared parser + releaseDocument()             0.00 MB
+//   a fresh JSDOM per page (what it replaced)     0.60 MB
+//
+// The shared-Window change was introduced to save the 1.8 MB/page a per-page
+// Window costs in garbage. It does save that. It also made *retention* 18x
+// worse, and retention is the thing that kills a pod.
+//
+// It went unnoticed for two reasons. The measurement that blessed it used a
+// 3 KB synthetic fixture whose document is small enough that retaining every
+// one is invisible. And in the real pipeline Readability strips the document
+// it is given down to the article, so a page that reaches Readability leaves
+// only a husk behind — 0.04 MB/page instead of 10.83. Only pages that skip or
+// fail Readability (JS shells, non-article pages, malformed markup, anything
+// taking the regex fallback) retain in full, which is why production showed a
+// mixed 2-3 MB per successful extraction rather than a clean 10.8.
+//
+// Safe to call as soon as the caller has read what it needs: everything
+// extractHtml takes out of a document is a string by then.
+function releaseDocument(doc) {
+  if (!doc) return;
+  try {
+    doc.replaceChildren();
+  } catch {
+    // A document type that does not support it is not worth failing a request
+    // over; the next parse releases it anyway.
+  }
+  if (lastDocument === doc) lastDocument = null;
+}
+
 // Returns a Document for `markup` (which should have been through
 // prepareMarkup), resolving relative URLs against `url`.
 //
@@ -138,9 +187,17 @@ function applyBaseUrl(doc, url) {
 // the point: that is the object that made every page cost 1.8 MB. Anything
 // needing `window` (getComputedStyle, layout, scripts) will not work on it,
 // and nothing here needs them.
+//
+// Releasing the previous document here, rather than leaving it to callers, is
+// what bounds this structurally: a caller that forgets to release costs one
+// retained document, not one per page. Callers should still release when they
+// are done, so the memory goes back between requests instead of at the next
+// one.
 function parseDocument(markup, url) {
+  if (lastDocument) releaseDocument(lastDocument);
   const doc = parser().parseFromString(markup, 'text/html');
   applyBaseUrl(doc, url);
+  lastDocument = doc;
   return doc;
 }
 
@@ -150,4 +207,9 @@ function windowsCreatedForTest() {
   return windowsCreated;
 }
 
-module.exports = { prepareMarkup, parseDocument, windowsCreatedForTest };
+module.exports = {
+  prepareMarkup,
+  parseDocument,
+  releaseDocument,
+  windowsCreatedForTest,
+};
