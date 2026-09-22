@@ -150,7 +150,10 @@ neither — it is one process crossing more and more restart windows. The tells:
 identical URLs that returned 200 earlier returning 502 later, many unrelated
 domains failing at once, and a `RESTARTS` count climbing in `kubectl get pods`.
 
-Two separate things were wrong. The second is the one that actually killed it.
+Two separate things were wrong, and the second is the one that killed it
+outright. A third — per-origin state that was never evicted — was found later,
+after the first two were fixed and the pod kept dying; it has its own section
+below, along with what the instrumentation added to find it now reports.
 
 ### 1. Churn: a jsdom Window per page
 
@@ -256,7 +259,8 @@ Rather than guess between those, `src/metrics.js` measures. It adds:
 
 ```
 [mem] req=500 (+50 in 61s) ok=412 http=61 net=27 robots=0 rl=0 cached=0
-      nocontent=9 pdf=3 bytes=612.4MB (+58.1MB) hosts=robots:431/limiter:433
+      nocontent=9 pdf=3 bytes=612.4MB (+58.1MB) rtxt=487/31.2MB(max 486KB)
+      hosts=robots:500/rKB:8104/rEvict:31/limiter:14
       rss=712.3MB heap=604.1/1024.0MB ext=18.2MB ab=2.1MB
       | retained +42.8MB = +0.856MB/req
 ```
@@ -268,6 +272,27 @@ Reading it:
 | `req` | per-request retention | what a request holds after it returns |
 | `hosts` | per-origin retention | `robots.js`'s cache, `rateLimiter.js`'s Maps, undici's pools |
 | `bytes` | what we read, not how often | buffers and extracted strings |
+| `rtxt` | what we read *and kept* per origin | `robots.js` — and note `bytes` never counted this |
+
+Two fields deserve their own note, because the first production reading of
+this line was misread without them.
+
+**`robots=` and `rtxt=` are unrelated numbers.** The first is how many requests
+were blocked by a `robots.txt`; the second is how many `robots.txt` files this
+process fetched, their total size, and the largest single one.
+
+**`bytes` is the target body only.** `robots.txt` is fetched by `src/robots.js`,
+never reached that counter, and in a sweep there is close to one per request —
+fetched, parsed, and (before the ceilings below) kept for the life of the
+process. So a reading like *"151 MB retained over 50 requests, and we only
+downloaded 8.4 MB"* compares retention against a number that excluded a whole
+class of downloads. `rtxt` closes that gap; `rKB` and `rEvict` in the `hosts`
+gauge say what the cache is holding now and how much it has had to throw away.
+
+If the ceilings are what flattens the curve, `rEvict` climbs while `robots`
+sits at `ROBOTS_CACHE_MAX`. If the heap still grows with those parked, the
+retention is undici's per-origin state or something per-request — which is
+what the `req` row is for.
 
 **Ignore the first line or two** — V8 code objects, Readability's regex caches
 and the shared parser Window are one-off costs that land in the first
@@ -275,13 +300,53 @@ interval and would otherwise read as a huge per-request figure.
 
 This is scaffolding, not a feature. Once the growth is identified and fixed,
 deleting `src/metrics.js`, `test/metrics.test.js`, the `MEM_LOG_EVERY` entry
-in `src/config.js`, the `bytes` field in `src/fetchTarget.js` and the calls in
-`server.js` should leave no trace.
+in `src/config.js`, the `bytes` field in `src/fetchTarget.js`, the
+`recordRobotsFetch()` call in `src/robots.js` and the calls in `server.js`
+should leave no trace. The *ceilings* below are not scaffolding and stay.
 
 If a heap snapshot is wanted instead, `NODE_OPTIONS=--heapsnapshot-near-heap-limit=1`
 as a Toolforge envvar makes the next OOM dump one — but it writes a file about
 the size of the heap (~1 GB) into the pod's working directory as it dies, so
 check disk before enabling it.
+
+### 3. Per-origin retention: the caches that never evicted
+
+`src/robots.js` and `src/rateLimiter.js` kept per-host `Map`s with no eviction
+at all. The README used to write that off as "bounded by how many distinct
+hosts a process sees... not a crash risk at this scale," and that reasoning has
+one bad assumption in it: for a citation sweep, *distinct hosts seen* is
+approximately *requests served*. The bound was the request count.
+
+Size per entry was the other half of the mistake. A `robots.txt` is not a
+small file at every publisher — hundreds of KB is ordinary, and
+`robots-parser` turns each line into a rule object, so the retained form is
+some multiple of that again. One per new origin, kept forever, is a per-request
+retention wearing a per-origin disguise.
+
+Both are now capped:
+
+| Structure | Ceiling | Evicts |
+|---|---|---|
+| `robots.js` parser cache | `ROBOTS_CACHE_MAX` (500 origins) **and** `ROBOTS_CACHE_MAX_BYTES` (8 MB of source) | expired entries first, then least-recently-used |
+| `rateLimiter.js` `nextAvailableAt` / `backoffUntil` | `HOST_STATE_MAX` (5,000) | expired entries; the ceiling is a backstop that should never bind |
+
+Both ceilings are needed on the robots cache: a count alone does not bound
+memory (500 fat files are not 500 thin ones), and a byte budget alone would
+allow tens of thousands of tiny entries.
+
+The rate limiter's sweep is not really an eviction policy. Both its Maps hold
+`host -> timestamp`, and an entry whose timestamp has passed is
+indistinguishable from an absent one — a reservation in the past imposes no
+wait, an expired backoff blocks nothing. Dropping those costs nothing at all,
+and it is what keeps the Maps at the *working* set (hosts seen in the last
+second, or backed off in the last 30) instead of every host ever seen.
+
+**This is a bound, not yet a diagnosis.** It removes a structure that was
+provably growing without limit and makes the `[mem]` line's `rtxt` / `rKB` /
+`rEvict` fields say how much it was actually holding. If the heap curve goes
+flat, that was it; if it doesn't, the same line now points at undici's
+per-origin pools or at something per-request, with one hypothesis eliminated
+rather than assumed.
 
 ### What is still unbounded
 
@@ -289,9 +354,8 @@ check disk before enabling it.
 budget. It has not been measured, and it is the obvious next place to look if
 the pod dies again on a URL ending in `.pdf`.
 
-`src/robots.js` and `src/rateLimiter.js` keep per-host `Map`s that are never
-evicted. Bounded by how many distinct hosts a process sees, and small per
-entry — not a crash risk at this scale, but not free either.
+undici's per-origin connection pools and TLS state, underneath `fetch`, are
+not bounded by anything in this repo. A sweep opens one per new origin.
 
 ## Publication metadata
 
@@ -425,6 +489,9 @@ All via environment variables (Toolforge envvars, never committed files):
 | `HOST_BACKOFF_MS` | `30000` | cooldown for a host after it returns 429 |
 | `ROBOTS_TIMEOUT_MS` | `5000` | timeout for fetching `robots.txt` |
 | `ROBOTS_CACHE_TTL_MS` | `3600000` | how long a host's `robots.txt` is cached |
+| `ROBOTS_CACHE_MAX` | `500` | most origins kept in the parsed-`robots.txt` cache |
+| `ROBOTS_CACHE_MAX_BYTES` | `8388608` (8 MB) | most `robots.txt` source bytes held at once. Both ceilings apply; see [Memory](#memory-what-killed-this-service-and-what-bounds-it-now) |
+| `HOST_STATE_MAX` | `5000` | backstop on the rate limiter's per-host Maps. Expired entries are swept first, so this should never bind |
 | `CACHE_TTL_OK_SECONDS` | `86400` | cache TTL for successful upstream responses |
 | `CACHE_TTL_ERROR_SECONDS` | `3600` | cache TTL for real (non-null) error statuses |
 | `MEM_LOG_EVERY` | `50` | emit a `[mem]` line every N requests; `0` disables it (`/metrics` still works). [Temporary](#the-instrumentation-temporary) |

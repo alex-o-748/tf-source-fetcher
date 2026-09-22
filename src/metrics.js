@@ -14,17 +14,30 @@ const { MEM_LOG_EVERY } = require('./config');
 // Local reproduction never saw it, and the reason is a gap in the harness,
 // not in the theory: every local run hit ONE plain-HTTP origin. Production
 // hits thousands of distinct HTTPS origins, roughly one new origin per
-// request for a citation sweep. Two known per-origin structures grow without
-// bound (`robots.js`'s parser cache and `rateLimiter.js`'s two Maps), and
-// undici keeps a connection pool and TLS state per origin underneath `fetch`.
+// request for a citation sweep. Two known per-origin structures grew without
+// bound (`robots.js`'s parser cache and `rateLimiter.js`'s two Maps — both
+// now capped, see below), and undici keeps a connection pool and TLS state
+// per origin underneath `fetch`.
 //
 // So the line below reports, per interval: how much heap was retained, how
 // many requests caused it, how many bytes were fetched, and how many origins
-// each unbounded structure is now holding. Growth tracking `req` points at
+// each per-origin structure is now holding. Growth tracking `req` points at
 // something per-request; growth tracking `hosts` points at the per-origin
 // structures; growth tracking `bytes` points at what we read rather than how
 // often. Those are different bugs with different fixes, and this is what
 // tells them apart.
+//
+// `rtxt` was added after the first production reading was misread. That
+// reading — 151 MB retained over 50 requests against "only 8.4 MB
+// downloaded" — treated the small byte count as ruling out what we read, and
+// concluded the growth had to be in parsing. But `bytes` counts the target
+// body only; a sweep also fetches one robots.txt per new origin, parses it,
+// and (before the cap) kept it forever. Those bytes were in neither number.
+// `rtxt` is fetch count / total / largest single file, and the `hosts` gauge
+// carries what the cache is holding now. If robots.txt is the retention, the
+// cap turns the curve flat and `rEvict` climbs; if the heap still grows with
+// `hosts` parked at its ceiling, it is undici's per-origin state or something
+// per-request, and this line says which.
 //
 // Deliberately cheap: integer counters, no per-request allocation, no new
 // unbounded structure of its own. The host gauges read the size of Maps that
@@ -51,6 +64,18 @@ const counts = {
 };
 
 let bytesFetched = 0;
+
+// robots.txt is fetched by src/robots.js, not src/fetchTarget.js, so it never
+// reached `bytesFetched` — and in a sweep there is close to one of them per
+// request, each one parsed and then *kept*. That made "151 MB retained while
+// only 8.4 MB was downloaded" a comparison against the wrong number: the
+// downloads the reading was meant to exonerate were not all being counted.
+// Tracked separately rather than folded into `bytesFetched`, because which of
+// the two is growing is the whole question.
+let robotsFetches = 0;
+let robotsBytes = 0;
+let robotsMaxBytes = 0;
+
 let gauges = () => ({});
 
 // Baseline for the per-interval deltas, reset each time a line is emitted.
@@ -89,12 +114,24 @@ function record(event = {}) {
   }
 }
 
+// One robots.txt read. `bytes` is 0 for a miss, a failure or a timeout — all
+// of which still cost a request, which is why the count is separate from the
+// total rather than inferred from it.
+function recordRobotsFetch(bytes = 0) {
+  robotsFetches += 1;
+  if (typeof bytes === 'number' && bytes > 0) {
+    robotsBytes += bytes;
+    if (bytes > robotsMaxBytes) robotsMaxBytes = bytes;
+  }
+}
+
 function snapshot() {
   const m = process.memoryUsage();
   return {
     uptimeSeconds: Math.round(process.uptime()),
     counts: { ...counts },
     bytesFetched,
+    robots: { fetches: robotsFetches, bytes: robotsBytes, maxBytes: robotsMaxBytes },
     memory: {
       rss: m.rss,
       heapUsed: m.heapUsed,
@@ -140,6 +177,10 @@ function formatLine() {
     `robots=${s.counts.robotsBlocked} rl=${s.counts.rateLimited} ` +
     `cached=${s.counts.cached} nocontent=${s.counts.noContent} pdf=${s.counts.pdf} ` +
     `bytes=${mb(s.bytesFetched).toFixed(1)}MB (+${mb(dBytes).toFixed(1)}MB) ` +
+    // `rtxt`, not `robots` — the existing `robots=` field is the count of
+    // requests blocked by robots.txt, which is a different number entirely.
+    `rtxt=${s.robots.fetches}/${mb(s.robots.bytes).toFixed(1)}MB` +
+    `(max ${Math.round(s.robots.maxBytes / 1024)}KB) ` +
     (hosts ? `hosts=${hosts} ` : '') +
     `rss=${mb(s.memory.rss).toFixed(1)}MB heap=${mb(s.memory.heapUsed).toFixed(1)}/` +
     `${mb(s.memory.heapTotal).toFixed(1)}MB ext=${mb(s.memory.external).toFixed(1)}MB ` +
@@ -173,10 +214,21 @@ function maybeLog(write = (line) => console.log(line)) {
 function resetForTest() {
   for (const key of Object.keys(counts)) counts[key] = 0;
   bytesFetched = 0;
+  robotsFetches = 0;
+  robotsBytes = 0;
+  robotsMaxBytes = 0;
   gauges = () => ({});
   resetMark();
 }
 
 resetMark();
 
-module.exports = { record, snapshot, formatLine, maybeLog, setGauges, resetForTest };
+module.exports = {
+  record,
+  recordRobotsFetch,
+  snapshot,
+  formatLine,
+  maybeLog,
+  setGauges,
+  resetForTest,
+};
