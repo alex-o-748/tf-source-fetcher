@@ -1,3 +1,13 @@
 node_modules/
 *.log
 .env
+
+# Real third-party pages captured by scripts/capture-fixtures.js. Not checked
+# in: third-party content, large, and they change under you. Regenerate with
+# `npm run fixtures`.
+test/fixtures/pages/
+
+# v8.writeHeapSnapshot() output from scripts/leak-hunt.js — each one is about
+# the size of the heap it captured.
+heapsnapshots/
+*.heapsnapshot

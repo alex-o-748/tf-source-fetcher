@@ -150,10 +150,9 @@ neither — it is one process crossing more and more restart windows. The tells:
 identical URLs that returned 200 earlier returning 502 later, many unrelated
 domains failing at once, and a `RESTARTS` count climbing in `kubectl get pods`.
 
-Two separate things were wrong, and the second is the one that killed it
-outright. A third — per-origin state that was never evicted — was found later,
-after the first two were fixed and the pod kept dying; it has its own section
-below, along with what the instrumentation added to find it now reports.
+Four things were wrong, found in that order, each after the previous fix
+failed to stop the crash loop. The fourth is the one that was killing it by
+the end — and it was introduced by the fix for the first.
 
 ### 1. Churn: a jsdom Window per page
 
@@ -173,9 +172,15 @@ What it does is put 1.8 MB of pressure per request on a heap that (2) was
 already driving to its ceiling. `src/parseDocument.js` builds exactly one
 Window for the life of the process and parses every page into a fresh,
 window-less `Document` with that Window's `DOMParser` — the same Document type
-a browser hands Readability. Measured 0.006 MB/page retained against 1.76, and
-~2x faster per page. Extraction output is byte-identical across article,
-JS-shell, malformed, fallback and metadata-header cases.
+a browser hands Readability. It is ~2x faster per page, and extraction output
+is byte-identical across article, JS-shell, malformed, fallback and
+metadata-header cases.
+
+**This fix introduced cause 4 below.** The "0.006 MB/page retained" this
+section used to claim was measured against a 3 KB synthetic fixture; against
+real pages the shared parser retains 10.83 MB/page, because it never let go of
+the documents it made. Keep the shared Window — it is still the right call —
+but read §4 before touching it.
 
 `JSDOM.fragment()` — the fix citation-checker-script's batch pipeline used for
 the same jsdom cost — is not available here: it returns a `DocumentFragment`,
@@ -348,6 +353,86 @@ flat, that was it; if it doesn't, the same line now points at undici's
 per-origin pools or at something per-request, with one hypothesis eliminated
 rather than assumed.
 
+### 4. Retention: the shared parser kept every document it made
+
+**This is what was killing the pod once (1), (2) and (3) were fixed**, and it
+came in with the fix for (1).
+
+A `Document` produced by the shared `DOMParser` stays reachable from the Window
+that owns that parser — and that Window is deliberately immortal. So every page
+the service had ever parsed was still in the heap. Measured over real-shaped
+pages (~160 KB), retained heap per page:
+
+| Arrangement | Retained |
+|---|---|
+| Shared parser, as it was | **10.83 MB/page** |
+| Shared parser + `releaseDocument()` | **0.00 MB/page** |
+| A fresh `new JSDOM()` per page (what the shared parser replaced) | 0.60 MB/page |
+
+The shared Window was introduced to save 1.8 MB/page of *garbage*. It does. It
+also made *retention* 18x worse than the thing it replaced, and retention is
+what kills a pod — garbage is reclaimed, retained objects are not.
+
+`releaseDocument(doc)` empties the document (`doc.replaceChildren()`), which is
+enough: the nodes become collectible while the parser stays warm. It runs two
+ways on purpose. `parseDocument()` releases the previous document on every
+call, so forgetting costs one retained document rather than one per page; and
+`extractHtml()` releases in a `finally`, so the memory goes back at the end of
+a request instead of at the start of the next one.
+
+**Why nothing caught it for so long.** Two measurement traps, both worth
+recognising again:
+
+1. **The fixture was too simple.** `scripts/load-memory.js` reported
+   0.0005 MB/request over 1,000 extractions. Its fixture is ~3 KB — one
+   heading, one paragraph, no nesting, no attributes. Retention here is per DOM
+   *node*, so a 40-node page hides what a 20,000-node page shows. A fixture can
+   be wrong by being simple, not just by being small.
+2. **Readability was cleaning up the evidence.** `_grabArticle` strips the
+   document it is handed down to the article, so a page that reaches
+   Readability leaves a husk — 0.04 MB/page instead of 10.83. The existing
+   retained-per-page test measured `extractHtml`, so it measured the masked
+   path and passed. The pages that retain in full are the ones that *skip*
+   Readability: JS-only shells, non-article pages, malformed markup, anything
+   taking the regex fallback. In production those are most of them, which is
+   why the live `[mem]` line showed a mixed 2-3 MB per successful extraction
+   rather than a clean 10.8.
+
+`test/parseDocument.test.js` pins all of it: two structural tests (the previous
+document is emptied; `releaseDocument` is idempotent and null-safe) and one
+measuring test that parses *without* Readability, over a deliberately
+node-dense fixture. All three fail against the unreleased shared parser — the
+measuring one at 23.5 MB/page — and the pre-existing `extractHtml` test passes
+against it, which is exactly the point.
+
+### Reproducing it locally: `npm run fixtures` && `npm run leak`
+
+Cause 4 was found by making the leak reproducible off the pod. Two scripts:
+
+```sh
+npm run fixtures            # save real pages to test/fixtures/pages (gitignored)
+npm run leak                # 400 extractions, retained heap per extraction
+npm run leak -- --stage parse          # bisect: which stage holds it
+npm run leak -- --parser fresh         # A/B the shared Window against per-page
+npm run leak -- --snapshot-at 100      # dump a heap snapshot at +100 MB
+```
+
+`--stage` runs progressively more of the pipeline over the same pages —
+`regex`, `parse`, `readability`, `full` — so the first stage that retains is
+the one holding the memory. That is what turned "extraction leaks" into
+"`parseDocument` leaks and Readability hides it" in about two minutes.
+
+`--snapshot-at N` writes a `.heapsnapshot` when retained heap crosses N MB.
+Open it in Chrome DevTools → Memory → Load and sort by Retained Size; the entry
+holding one object per extraction is the leak. The file is roughly the size of
+the heap it captured, so mind the disk.
+
+**Capture real pages.** `npm run leak` refuses to run without fixtures rather
+than falling back to a synthetic page, because a synthetic page is how this
+went unnoticed. `npm run fixtures` takes a file of URLs as its first argument
+(one per line) if the built-in list does not match what your traffic looks
+like.
+
 ### What is still unbounded
 
 `MAX_PDF_BYTES` is 25 MB and the PDF path (`unpdf`) has no equivalent parse
@@ -503,6 +588,12 @@ npm install
 npm start          # reads PORT (defaults to 8080), REDIS_URL, etc.
 npm test           # runs test/e2e.test.js against a local fixture server
 ```
+
+Memory work has two entry points beyond `npm test`: `npm run test:memory` (the
+retained-memory regression, synthetic fixture) and `npm run fixtures` +
+`npm run leak` (the real-page leak hunt — see
+[Reproducing it locally](#reproducing-it-locally-npm-run-fixtures--npm-run-leak)).
+Prefer the latter when chasing something the former says is not there.
 
 `test/extractHtml.test.js` covers text extraction directly — the byline/date
 shapes above, the metadata header, the under-selection guard, and truncation.
