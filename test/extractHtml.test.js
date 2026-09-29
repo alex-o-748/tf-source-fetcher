@@ -79,6 +79,59 @@ test('date in a <meta> Readability does not read is recovered', () => {
   assert.match(extractHtml(html, URL).content, /Published: 2026-08-23T07:41:00-07:00/);
 });
 
+// --- Drupal's "Submitted by … on …" byline ---------------------------------
+//
+// Reported on sunshinestatenews.com (Drupal): the Cloudflare Worker returned
+// "Submitted by Kevin Derby on August 24, 2010 - 10:41pm", this service
+// returned only a Title line and the body, and a claim dated August 24, 2010
+// came back NOT SUPPORTED. Drupal marks its byline `class="submitted"` (D7) or
+// `node__submitted` (D8+), a name in neither Readability's byline pattern nor
+// ours, and puts the machine-readable date in RDFa on a <span>, which
+// Readability's metadata pass — <meta> elements only — never looks at.
+
+function drupalPage(submitted) {
+  return (
+    `<!doctype html><html><head><title>${HEADLINE} | Site</title></head><body>` +
+    `<div id="skip-link"><a href="#main-content">Skip to main content</a></div>` +
+    `<div id="node-1" class="node node-blog node-full clearfix">` +
+    `<h1 class="title">${HEADLINE}</h1>${submitted}` +
+    `<div class="content"><div class="field field-name-body">${bodyProse()}</div></div>` +
+    `</div></body></html>`
+  );
+}
+
+test('Drupal 7 byline: date kept from the visible text and from RDFa', () => {
+  const html = drupalPage(
+    '<div class="submitted"><span property="dc:date dc:created" ' +
+      'content="2010-08-24T22:41:00-04:00" datatype="xsd:dateTime" rel="sioc:has_creator">' +
+      'Submitted by <span class="username" typeof="sioc:UserAccount" property="foaf:name">' +
+      'Kevin Derby</span> on August 24, 2010 - 10:41pm</span></div>'
+  );
+  const { content } = extractHtml(html, URL);
+  assert.match(content, /Published: 2010-08-24T22:41:00-04:00/);
+  assert.match(content, /By: Submitted by Kevin Derby on August 24, 2010 - 10:41pm/);
+});
+
+test('Drupal 8+ byline: node__submitted with schema.org RDFa', () => {
+  const html = drupalPage(
+    '<div class="node__submitted">Submitted by <span class="field--name-uid">' +
+      '<span property="schema:name">Kevin Derby</span></span> on ' +
+      '<span class="field--name-created" property="schema:dateCreated" ' +
+      'content="2010-08-24T22:41:00-04:00">Tue, 08/24/2010 - 22:41</span></div>'
+  );
+  const { content } = extractHtml(html, URL);
+  assert.match(content, /Published: 2010-08-24T22:41:00-04:00/);
+  assert.match(content, /By: Submitted by Kevin Derby on Tue, 08\/24\/2010/);
+});
+
+test('an RDFa modification date is not reported as the publication date', () => {
+  const html = drupalPage(
+    '<span property="dc:modified" content="2027-01-15T00:00:00Z"></span>' +
+      '<span property="schema:dateModified" content="2027-01-15T00:00:00Z"></span>'
+  );
+  assert.doesNotMatch(extractHtml(html, URL).content, /Published:.*2027/);
+});
+
 test('the headline is restored to the extracted text', () => {
   // article.textContent starts at the first body paragraph; Readability
   // removes the <h1> as a duplicate of the document title and exposes it

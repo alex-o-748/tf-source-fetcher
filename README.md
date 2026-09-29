@@ -483,8 +483,17 @@ Site: 9to5Mac
   service follows citations to sources in any language.
 - `article.publishedTime` covers JSON-LD `datePublished`,
   `article:published_time` and `parsely-pub-date`. A few more publication-date
-  tags (`itemprop="datePublished"`, `DC.date.issued`, …) and `<time datetime>`
-  inside a byline-ish container or a `<header>` are read as a fallback.
+  tags (`itemprop="datePublished"`, `DC.date.issued`, …), the same properties
+  as RDFa/microdata attributes on any element (`property="dc:date"`,
+  `schema:datePublished`, …), and `<time datetime>` inside a byline-ish
+  container or a `<header>` are read as a fallback.
+- **Drupal** gets explicit coverage because it matched none of the above: its
+  byline is `div.submitted` / `div.node__submitted` ("Submitted by *name* on
+  *date*"), a class Readability's byline pattern doesn't know, and its
+  machine-readable date is RDFa on a `<span>`, which Readability's `<meta>`-only
+  metadata pass never reads. A Sunshine State News report of an election
+  result had its only date — the byline's — dropped this way, and the claim
+  dated to it came back "not supported".
 - **Modification dates are deliberately not used.** Presenting a "last
   updated" stamp as the publication date trades a missing fact for a wrong
   one, which is worse for a verdict than silence. An unqualified

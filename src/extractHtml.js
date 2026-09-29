@@ -21,12 +21,18 @@ const UNDERSELECTION_RATIO = 5;
 // cover date-only containers it leaves in place but which we still want to
 // recognize when hunting for a <time> element.
 const DATE_CONTEXT_RE =
-  /byline|author|dateline|writtenby|p-author|post-date|entry-date|published|pubdate|timestamp/i;
+  /byline|author|dateline|writtenby|p-author|post-date|entry-date|published|pubdate|timestamp|submitted/i;
 
 // Elements that hold publication metadata on a typical news CMS — the same
 // nodes Readability strips from the article body. Matched in document order,
 // so an author-bio box at the foot of the article loses to the byline at the
 // top.
+//
+// `submitted` is Drupal's byline — "Submitted by <name> on <date>", in
+// `div.submitted` (D7) or `div.node__submitted` (D8+). Readability's byline
+// pattern doesn't know the name, so it is neither stripped as a byline nor
+// reliably kept: the div sits beside the body field, outside the container
+// Readability selects, and was being dropped with the rest of the chrome.
 const BYLINE_SELECTOR = [
   '[rel~="author" i]',
   '[itemprop~="author" i]',
@@ -37,6 +43,7 @@ const BYLINE_SELECTOR = [
   '[class*="entry-date" i]',
   '[class*="published" i]',
   '[class*="timestamp" i]',
+  '[class*="submitted" i]',
   '[id*="byline" i]',
   '[id*="author" i]',
 ].join(',');
@@ -65,6 +72,27 @@ const PUBLISHED_META_SELECTORS = [
   'meta[name="article.published" i]',
   'meta[name="DC.date.issued" i]',
   'meta[name="dcterms.issued" i]',
+].join(',');
+
+// The same facts expressed as RDFa or microdata on *any* element, not just
+// <meta>. Readability's metadata pass reads <meta> tags only, so these are
+// invisible to it — and they are how Drupal publishes its dates, e.g.
+//
+//   <span property="dc:date dc:created" content="2010-08-24T22:41:00-04:00">
+//
+// Drupal records creation, not publication, but for a CMS node the two are
+// the same moment. Modification properties (dc:modified, schema:dateModified)
+// are absent for the reason given above.
+const PUBLISHED_ATTR_SELECTORS = [
+  '[property~="dc:date" i][content]',
+  '[property~="dc:created" i][content]',
+  '[property~="dc:issued" i][content]',
+  '[property~="dcterms:created" i][content]',
+  '[property~="dcterms:issued" i][content]',
+  '[property~="schema:datePublished" i][content]',
+  '[property~="schema:dateCreated" i][content]',
+  '[itemprop~="datePublished" i][content]',
+  '[itemprop~="datePublished" i][datetime]',
 ].join(',');
 
 // Same crude strip-and-collapse approach as the reference Worker's
@@ -138,6 +166,11 @@ function findPublishedTime(doc) {
   const metaContent = meta && meta.getAttribute('content');
   if (metaContent && metaContent.trim()) {
     return metaContent.trim();
+  }
+
+  for (const node of doc.querySelectorAll(PUBLISHED_ATTR_SELECTORS)) {
+    const value = (node.getAttribute('content') || node.getAttribute('datetime') || '').trim();
+    if (value) return value;
   }
 
   for (const time of doc.querySelectorAll('time[datetime]')) {
