@@ -2,6 +2,7 @@
 
 const { extractHtml } = require('./extractHtml');
 const { extractPdf, InvalidPageError } = require('./extractPdf');
+const { networkErrorCode } = require('./networkError');
 const {
   USER_AGENT,
   FETCH_TIMEOUT_MS,
@@ -71,7 +72,8 @@ function isPdf(targetUrl, contentType) {
 // this runs and the result needs to be cache-keyed by the caller.
 //
 // Returns one of:
-//   { networkError: true, error }                    — upstream unreachable
+//   { networkError: true, error, errorCode }         — upstream unreachable;
+//                                                      errorCode per src/networkError.js
 //   { invalidPage: true, error, status, totalPages }  — bad `page` for a PDF
 //   { content, error, status, pdf, totalPages, page, truncated, fetchedAt }
 //
@@ -97,9 +99,10 @@ async function fetchAndExtract(targetUrl, pageParam, { signal } = {}) {
   } catch (e) {
     clearTimeout(timer);
     signal?.removeEventListener('abort', abort);
-    const reason =
-      e.name === 'AbortError' ? 'Request to source timed out' : e.message || 'Network error';
-    return { networkError: true, error: reason };
+    if (e.name === 'AbortError') {
+      return { networkError: true, error: 'Request to source timed out', errorCode: null };
+    }
+    return { networkError: true, error: e.message || 'Network error', errorCode: networkErrorCode(e) };
   }
 
   const fetchedAt = new Date().toISOString();
@@ -135,7 +138,11 @@ async function fetchAndExtract(targetUrl, pageParam, { signal } = {}) {
         error: `Source content exceeds the ${pdf ? 'PDF' : 'HTML'} size limit`,
       };
     }
-    return { networkError: true, error: e.message || 'Failed reading response body' };
+    return {
+      networkError: true,
+      error: e.message || 'Failed reading response body',
+      errorCode: networkErrorCode(e),
+    };
   }
   try {
     if (pdf) {

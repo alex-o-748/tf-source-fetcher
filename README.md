@@ -109,6 +109,23 @@ a fact about the article:
 | Blocked by the target host's `robots.txt` | `403` | we never contacted the host |
 | Throttled by our own per-host rate limiter | `429` | we never contacted the host this time; try again shortly |
 
+An unreachable-host response also carries **`errorCode`**: Node's code for
+why the connection failed, e.g. `ENOTFOUND` (no DNS record), `ECONNREFUSED`,
+`UND_ERR_CONNECT_TIMEOUT`, `ECONNRESET`, or a certificate error such as
+`CERT_HAS_EXPIRED`. `error` alone is useless for this: Node reports nearly
+every connection failure as the same `"fetch failed"`. `errorCode` is `null`
+when no code is available, including our own overall timeout (`error` then
+reads `"Request to source timed out"`).
+
+```json
+{ "content": null, "error": "fetch failed", "errorCode": "ENOTFOUND", "status": null }
+```
+
+It exists so a caller can tell a dead domain from a blip. Retrying
+`ENOTFOUND` or a certificate error reproduces it every time; the batch client
+(`core/worker.js` in citation-checker-script) skips the retry for those and
+goes straight to its Wayback fallback.
+
 The service's own outer HTTP status mirrors the JSON body's `status` field
 whenever that field is a number (including robots.txt blocks and our own
 rate-limit responses), and is `502` when it's `null`. The client's own
@@ -538,7 +555,12 @@ for benchmark comparisons.
   1h (`CACHE_TTL_ERROR_SECONDS`) — treated as a "fact about the world" worth
   remembering, but for less long, since a paywall or a rate limit can lift.
 - Unreachable-host results (`status: null`) and our own rate-limit refusals
-  are never cached — they're transient by nature.
+  are not cached — most are transient by nature. The exception is a failure
+  that describes the publisher's own setup rather than the network between
+  us: `errorCode` `ENOTFOUND` or a TLS/certificate error. Those cache for 1h,
+  like a 404 (`src/networkError.js`). Refused connections and connect
+  timeouts stay uncached: a server mid-restart, or an egress blip on our side,
+  looks the same, and caching it would stretch seconds of outage into an hour.
 - If Redis is unreachable at startup, the service still starts; it just runs
   without a cache (logged once, not a hard failure).
 

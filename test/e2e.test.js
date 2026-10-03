@@ -119,10 +119,49 @@ test('unreachable host: status null in body, 502 at transport level ("dead")', a
   assert.ok(body.error);
 });
 
+test('refused connection: carries errorCode, and is not cached', async () => {
+  // A port that was just free: bind, read it, release.
+  const probe = require('net').createServer();
+  await new Promise((resolve) => probe.listen(0, '127.0.0.1', resolve));
+  const { port } = probe.address();
+  await new Promise((resolve) => probe.close(resolve));
+
+  const target = `http://127.0.0.1:${port}/gone`;
+  const first = await callFetch(target);
+  assert.equal(first.httpStatus, 502);
+  assert.equal(first.body.status, null);
+  assert.equal(first.body.error, 'fetch failed');
+  assert.equal(first.body.errorCode, 'ECONNREFUSED');
+
+  const second = await callFetch(target);
+  assert.equal(second.body.cached, false, 'a refused connection may be a restart — never cached');
+});
+
+test('unresolvable domain: errorCode ENOTFOUND, cached like a 404', async (t) => {
+  // .invalid is reserved (RFC 2606) and never resolves — but a sandbox with
+  // no resolver at all reports EAI_AGAIN instead, which is not this case.
+  const target = `http://source-fetcher-e2e-${Date.now()}.invalid/page`;
+  const first = await callFetch(target);
+  if (first.body.errorCode !== 'ENOTFOUND') {
+    t.skip(`no DNS resolver here (got ${first.body.errorCode})`);
+    return;
+  }
+  assert.equal(first.httpStatus, 502);
+  assert.equal(first.body.status, null);
+  assert.equal(first.body.cached, false);
+
+  const second = await callFetch(target);
+  assert.equal(second.httpStatus, 502, 'a cached network failure keeps its 502');
+  assert.equal(second.body.cached, true);
+  assert.equal(second.body.errorCode, 'ENOTFOUND');
+  assert.equal(second.body.status, null);
+});
+
 test('slow/hanging host times out as a network error, not a hang', async () => {
   const { body } = await callFetch(`${FIXTURES_BASE}/slow`);
   assert.equal(body.status, null);
   assert.ok(/timed out/i.test(body.error));
+  assert.equal(body.errorCode, null);
 });
 
 test('robots.txt disallowed path is blocked as a 403', async () => {
