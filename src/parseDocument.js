@@ -64,9 +64,14 @@ const { MAX_PARSE_BYTES } = require('./config');
 // output, it only stops us paying to parse them. Dropping stylesheets also
 // ends the `Could not parse CSS stylesheet` / `[csstree-match] BREAK after
 // 15000 iterations` floods that filled the pod logs and buried the OOM traces.
+//
+// JSON-LD is the exception: `<script type="application/ld+json">` is data,
+// not code, and it is where most news sites publish `datePublished`, which
+// Readability reads into `article.publishedTime`. Dropping it with the other
+// scripts silently removed the publication date from every such page.
 const DROPPABLE = [
   /<!--[\s\S]*?-->/g,
-  /<script\b[^>]*>[\s\S]*?<\/script>/gi,
+  /<script\b(?![^>]*application\/ld\+json)[^>]*>[\s\S]*?<\/script>/gi,
   /<style\b[^>]*>[\s\S]*?<\/style>/gi,
 ];
 
