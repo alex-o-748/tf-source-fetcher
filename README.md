@@ -57,9 +57,9 @@ memory only: no URLs, no fetched content, nothing a caller supplied.
   the single most important field.
 - **`content`** is only ever present when the extracted *body* is at least 101
   characters; shorter content is reported as the "no usable content" error
-  below instead. On the Readability path the body is preceded by a short
-  metadata header (see [Publication metadata](#publication-metadata)); that
-  header does not count toward the 101-character floor.
+  below instead. When the page carries publication metadata the body is
+  preceded by a short header (see [Extraction](#extraction)); that header
+  does not count toward the 101-character floor.
 - **`truncated`** is `true` whenever we did not return the whole source. Two
   causes: the extracted text was cut at 100,000 characters (matching the
   reference Worker's tuning), or the page itself was too large to extract from
@@ -117,14 +117,12 @@ status if that field is missing, so either way is safe to depend on.
 
 ## Behavior carried over from the reference Worker
 
-- HTML extraction primarily uses [`@mozilla/readability`](https://github.com/mozilla/readability)
-  (a real article-extraction pass — Node has no Cloudflare Workers runtime
-  constraints, so this is a meaningful upgrade over the Worker's regex tag
-  stripping) and falls back to the Worker's original strip-and-collapse
-  regex approach when Readability can't find an article (JS-only shells,
-  non-article pages) or returns implausibly little of one. Unlike the Worker,
-  this path prefixes the text with the headline, byline and publication date —
-  see [Publication metadata](#publication-metadata) for why that is load-bearing.
+- HTML extraction returns the page's visible text, as the Worker does
+  (strip scripts, styles, `<nav>`, `<header>`, `<footer>` and tags), with
+  entities fully decoded. Unlike the Worker, it prefixes a publication-date /
+  byline / site header read from the page's metadata, and uses
+  [`@mozilla/readability`](https://github.com/mozilla/readability)'s article
+  selection for pages too long to return whole — see [Extraction](#extraction).
 - PDF extraction uses [`unpdf`](https://github.com/unjs/unpdf), the same
   library the Worker uses, including per-page extraction when `page` is
   given. Every PDF document is explicitly cleaned up and its loading task is
@@ -442,72 +440,93 @@ the pod dies again on a URL ending in `.pdf`.
 undici's per-origin connection pools and TLS state, underneath `fetch`, are
 not bounded by anything in this repo. A sweep opens one per new origin.
 
-## Publication metadata
+## Extraction
 
-`article.textContent` — all this service used to return — is the article
-**body**. Readability computes the headline, byline and publication date
-separately and removes them from that body: `_grabArticle` drops any node
-whose class/id matches `/byline|author|dateline|writtenby|p-author/i`, or
-which carries `rel="author"`, and parks the text in `article.byline`. On most
-news CMSes the publication date sits in that same element.
-
-The consequence was not cosmetic. A claim like *"the impressions appeared in
-August 2026"* is unverifiable against a source whose date has been stripped,
-and the verifier reports that as **the citation failing** rather than as the
-fetcher failing — so a fetcher-side omission surfaced to editors as a false
-"not supported" verdict. The reference Cloudflare Worker never had this
-problem, because crude tag-stripping keeps everything; the failure was
-specific to this service, and therefore to the batch pipeline that uses it.
-
-So on the Readability path the extracted text is now prefixed with whatever
-of these is available, followed by a blank line:
+An HTML page comes back as its **crude text** — every visible string, minus
+scripts, styles, `<nav>`, `<header>` and `<footer>` — preceded by a header of
+whatever publication metadata the page carries:
 
 ```
-Title: Here’s what people who have used the iPhone Ultra like most
 Published: 2026-08-23T07:41:00-07:00
 By: Chance Miller | Aug 23 2026 - 7:41 am PT
 Site: 9to5Mac
 
-<article body>
+Here’s what people who have used the iPhone Ultra like most | 9to5Mac Here’s what …
 ```
 
-- It goes at the **front** so the date outlives `MAX_CONTENT_CHARS`
-  truncation. In the Worker's output the date sits wherever it fell on the
-  page and is lost whenever the cut lands above it.
-- The byline is captured from the DOM **before** `parse()` runs, and widened
-  to the byline node's parent when that parent is also short. Markup like
-  `<div class="meta"><a rel="author">Name</a> | Aug 23 2026</div>` otherwise
-  loses the date entirely — Readability matches the inner `<a>`, records only
-  `Name`, and removes the whole container. The surrounding text is kept
-  verbatim rather than having a date pattern-matched out of it, since this
-  service follows citations to sources in any language.
-- `article.publishedTime` covers JSON-LD `datePublished`,
-  `article:published_time` and `parsely-pub-date`. A few more publication-date
-  tags (`itemprop="datePublished"`, `DC.date.issued`, …) and `<time datetime>`
-  inside a byline-ish container or a `<header>` are read as a fallback.
-- **Modification dates are deliberately not used.** Presenting a "last
-  updated" stamp as the publication date trades a missing fact for a wrong
-  one, which is worse for a verdict than silence. An unqualified
+[Readability](https://github.com/mozilla/readability) is used for two things
+only: reading that metadata, and choosing what to keep when the crude text
+would not fit under `MAX_CONTENT_CHARS` (100,000) — there its article
+selection decides where the budget goes, instead of the cut landing wherever
+it lands.
+
+### Why not return Readability's article text
+
+This service used to. Readability is a reader view: it keeps the block it
+judges to be the article and discards the rest, and what it discards includes
+exactly the things a citation is often checked against — bylines and
+datelines (`_grabArticle` removes anything matching
+`/byline|author|dateline|writtenby|p-author/i`, and anything outside the
+selected container), info panels ("1B+ Downloads" on a Google Play page),
+and content in `aria-hidden` panels expanded by script. A missing date is
+not cosmetic: the verifier reports a claim it cannot find support for as
+**the citation failing**, not the fetcher. A Sunshine State News report of
+an election result (Drupal, byline `div.submitted`) and two BBC articles all
+lost their only displayed date this way, and claims dated to them came back
+"not supported" or "partially supported".
+
+Patching that per CMS — a selector for Drupal's byline, another for the
+next site — never ends. The model reading the text copes with leftover
+navigation and captions far better than it copes with a missing fact.
+
+### The evidence (2026-10-02)
+
+Every source in citation-checker-script's benchmark was fetched the same
+day through the Worker (crude) and through this service (Readability), and
+each version run through the verifier with gpt-oss-20b. Scored on the 129
+rows where both fetches and every model call succeeded:
+
+| Text the model saw | Exact verdict | Failing citations caught | Good citations flagged |
+|---|---|---|---|
+| Crude | 79 | 68/74 | 23/55 |
+| Readability (run 1) | 82 | 70/74 | 25/55 |
+| Readability (run 2) | 81 | 70/74 | 26/55 |
+| **Crude + metadata header** (this design) | **85** | 69/74 | **22/55** |
+
+The overall gaps are within noise — the two Readability runs saw identical
+text and still disagreed on 18 rows. What is not noise is where the dates
+went. Of the claims naming a month and year, each extraction lost three the
+other kept: Readability dropped dates shown in visible bylines, and the crude
+text lacked dates that exist only in metadata. The combined text kept all six,
+and the model got all six right.
+
+### The metadata header
+
+- **Published** — Readability's `article.publishedTime` (JSON-LD
+  `datePublished`, `article:published_time`, `parsely-pub-date`), else other
+  publication `<meta>` tags (`itemprop="datePublished"`, `DC.date.issued`, …),
+  else RDFa/microdata on any element (`property="dc:date"`,
+  `schema:datePublished`, …), else a `<time datetime>` inside a byline-ish
+  container or a `<header>`.
+- **By** — the byline element's full text, captured before Readability runs
+  and widened to its parent when that parent is also short, since markup like
+  `<div class="meta"><a rel="author">Name</a> | Aug 23 2026</div>` puts the
+  date beside the author link. Kept verbatim rather than date-parsed, since
+  this service follows citations in every language. Mostly redundant with the
+  body, but not when the byline sits inside an `<header>` element, which the
+  crude text strips along with the site banner.
+- **Site** — `og:site_name` and equivalents.
+- It goes at the **front** so it survives truncation.
+- **Modification dates are never used.** Presenting a "last updated" stamp as
+  the publication date trades a missing fact for a wrong one. An unqualified
   `time[datetime]` search is avoided for the same reason — it returns dates
   the article is *about*.
-- The header is **not** added on the regex fallback path, which already keeps
-  whatever byline and date the page displayed.
+- No header is emitted for a page Readability judges not to be an article.
 
-### Under-selection guard
-
-The fallback to regex extraction previously fired only when Readability
-returned *nothing*. A parse that returns a sliver of the wrong container —
-`aria-hidden="true"` wrappers are the realistic trigger, since collapsed
-accordions and "read more" panels carry it in the served HTML and are
-expanded by script this service never runs — cleared the 101-character floor
-and shipped as the source, which is worse than the crude extraction it
-replaced because it is confidently and silently wrong.
-
-Readability output under 500 characters is now compared against the regex
-extraction, and the regex result is preferred if it is at least 5× longer.
-The thresholds are deliberately far apart: Readability returns far less text
-than `regexExtract` on *every* page — that is the point of it — so the guard
-has to trigger on "a fragment instead of an article", never on "smaller".
+JSON-LD blocks survive `prepareMarkup()`'s script strip for this reason. They
+did not until 2026-10-02: every `<script>` was dropped before parsing, so
+Readability never saw a JSON-LD `datePublished` and the most common source of
+publication dates silently produced none.
 
 ## Politeness
 
@@ -596,7 +615,7 @@ retained-memory regression, synthetic fixture) and `npm run fixtures` +
 Prefer the latter when chasing something the former says is not there.
 
 `test/extractHtml.test.js` covers text extraction directly — the byline/date
-shapes above, the metadata header, the under-selection guard, and truncation.
+shapes above, the metadata header, crude-text extraction, and truncation.
 It needs no network and no Redis, so `npm run test:unit` runs anywhere.
 
 `test/parseDocument.test.js` covers HTML parsing and the two memory bugs behind

@@ -79,10 +79,62 @@ test('date in a <meta> Readability does not read is recovered', () => {
   assert.match(extractHtml(html, URL).content, /Published: 2026-08-23T07:41:00-07:00/);
 });
 
-test('the headline is restored to the extracted text', () => {
-  // article.textContent starts at the first body paragraph; Readability
-  // removes the <h1> as a duplicate of the document title and exposes it
-  // only as article.title, which used to be discarded.
+// --- Drupal's "Submitted by … on …" byline ---------------------------------
+//
+// Reported on sunshinestatenews.com (Drupal): the Cloudflare Worker returned
+// "Submitted by Kevin Derby on August 24, 2010 - 10:41pm", this service
+// returned only a Title line and the body, and a claim dated August 24, 2010
+// came back NOT SUPPORTED. Drupal marks its byline `class="submitted"` (D7) or
+// `node__submitted` (D8+), a name in neither Readability's byline pattern nor
+// ours, and puts the machine-readable date in RDFa on a <span>, which
+// Readability's metadata pass — <meta> elements only — never looks at.
+
+function drupalPage(submitted) {
+  return (
+    `<!doctype html><html><head><title>${HEADLINE} | Site</title></head><body>` +
+    `<div id="skip-link"><a href="#main-content">Skip to main content</a></div>` +
+    `<div id="node-1" class="node node-blog node-full clearfix">` +
+    `<h1 class="title">${HEADLINE}</h1>${submitted}` +
+    `<div class="content"><div class="field field-name-body">${bodyProse()}</div></div>` +
+    `</div></body></html>`
+  );
+}
+
+test('Drupal 7 byline: date kept from the visible text and from RDFa', () => {
+  const html = drupalPage(
+    '<div class="submitted"><span property="dc:date dc:created" ' +
+      'content="2010-08-24T22:41:00-04:00" datatype="xsd:dateTime" rel="sioc:has_creator">' +
+      'Submitted by <span class="username" typeof="sioc:UserAccount" property="foaf:name">' +
+      'Kevin Derby</span> on August 24, 2010 - 10:41pm</span></div>'
+  );
+  const { content } = extractHtml(html, URL);
+  assert.match(content, /Published: 2010-08-24T22:41:00-04:00/);
+  assert.match(content, /By: Submitted by Kevin Derby on August 24, 2010 - 10:41pm/);
+});
+
+test('Drupal 8+ byline: node__submitted with schema.org RDFa', () => {
+  const html = drupalPage(
+    '<div class="node__submitted">Submitted by <span class="field--name-uid">' +
+      '<span property="schema:name">Kevin Derby</span></span> on ' +
+      '<span class="field--name-created" property="schema:dateCreated" ' +
+      'content="2010-08-24T22:41:00-04:00">Tue, 08/24/2010 - 22:41</span></div>'
+  );
+  const { content } = extractHtml(html, URL);
+  assert.match(content, /Published: 2010-08-24T22:41:00-04:00/);
+  assert.match(content, /By: Submitted by Kevin Derby on Tue, 08\/24\/2010/);
+});
+
+test('an RDFa modification date is not reported as the publication date', () => {
+  const html = drupalPage(
+    '<span property="dc:modified" content="2027-01-15T00:00:00Z"></span>' +
+      '<span property="schema:dateModified" content="2027-01-15T00:00:00Z"></span>'
+  );
+  assert.doesNotMatch(extractHtml(html, URL).content, /Published:.*2027/);
+});
+
+test('the headline is in the extracted text', () => {
+  // Readability's article text drops the <h1> as a duplicate of the document
+  // title; the crude page text keeps both.
   assert.match(extractHtml(page(), URL).content, /iPhone Ultra like most/);
 });
 
@@ -127,10 +179,8 @@ test('bodyChars measures the body only, never the header', () => {
 
 // --- fallback behavior -----------------------------------------------------
 
-test('a page Readability cannot parse still falls back to regex extraction', () => {
-  // Unconditional fallback, unchanged from before the header was added: a
-  // short non-article page yields whatever the regex gets, even when that is
-  // well under the under-selection guard's threshold.
+test('a page Readability cannot parse still yields its text', () => {
+  // A short non-article page: no header, but the crude text is all there.
   const html =
     '<!doctype html><html><body><div>' +
     'Record 4412. Status: active. Registered 14 March 2011 under the county register, ' +
@@ -142,16 +192,11 @@ test('a page Readability cannot parse still falls back to regex extraction', () 
   assert.ok(bodyChars > 0);
 });
 
-test('under-selection falls back rather than shipping a fragment', () => {
-  // The old fallback only fired when Readability returned *nothing*. A parse
-  // that returns a sliver of the wrong container cleared MIN_CONTENT_CHARS
-  // and shipped as the source — worse than the crude extraction it replaced,
-  // because it is confidently and silently wrong.
-  //
-  // aria-hidden is the realistic trigger: Readability's _isProbablyVisible
-  // skips those subtrees, and collapsed accordions, tabbed panels and
-  // "read more" wrappers carry aria-hidden="true" in the served HTML,
-  // expanded by script we never run. Here it leaves Readability with one
+test('content a reader view would skip is still returned', () => {
+  // The case that motivated extracting the crude page text: aria-hidden is
+  // what collapsed accordions, tabbed panels and "read more" wrappers carry in
+  // the served HTML, expanded by script we never run. Readability's
+  // _isProbablyVisible skips those subtrees, which here would leave one
   // 82-character intro against 5kB of real content.
   const intro = '<p>This page collects the committee findings for the 2026 review period.</p>';
   const realContent = Array.from(
@@ -168,27 +213,77 @@ test('under-selection falls back rather than shipping a fragment', () => {
   );
 
   assert.match(content, /Finding 29/, 'the real content must be present, not just the intro');
-  assert.ok(bodyChars > 4000, `fell back to a fragment instead: ${bodyChars} chars`);
+  assert.ok(bodyChars > 4000, `returned a fragment instead: ${bodyChars} chars`);
 });
 
-test('the guard does not fire on a normal article', () => {
-  // Readability legitimately returns far less text than regexExtract on
-  // every page — that is the point of it, and the reason the truncation cap
-  // bites less often. A guard that treats "smaller" as "broken" would undo
-  // the entire benefit, so this pins that an ordinary article still comes
-  // back through the Readability path. Only that path emits a header, which
-  // makes the header the signal that no fallback happened.
+test('a byline outside the article container is kept, whatever its class', () => {
+  // The reported failure, generalized. A date shown on the page beside the
+  // article — in an element whose class no selector list anticipated — used
+  // to be dropped with the rest of the chrome, and a claim dated to it came
+  // back NOT SUPPORTED. The crude text keeps everything visible.
+  const html =
+    `<!doctype html><html><head><title>${HEADLINE}</title></head><body>` +
+    `<div class="node"><h1>${HEADLINE}</h1>` +
+    `<div class="post-meta-xyz">Posted on 24 August 2010 - 10:41pm</div>` +
+    `<div class="content">${bodyProse()}</div></div></body></html>`;
+
+  assert.match(extractHtml(html, URL).content, /24 August 2010/);
+});
+
+test('an ordinary article returns the page text after the metadata header', () => {
   const nav = '<nav>Home | iPhone | Mac | iPad | Watch | Vision | Guides | Store</nav>';
   const html =
-    `<!doctype html><html><head><title>${HEADLINE}</title></head><body>${nav}` +
-    `<article><h1>${HEADLINE}</h1>` +
+    `<!doctype html><html><head><title>${HEADLINE}</title>` +
+    `<meta property="article:published_time" content="2026-08-23T07:41:00-07:00"></head>` +
+    `<body>${nav}<article><h1>${HEADLINE}</h1>` +
     `<div class="author-byline">Chance Miller | Aug 23 2026 - 7:41 am PT</div>` +
     `${bodyProse(12)}</article></body></html>`;
 
   const { content } = extractHtml(html, URL);
-  assert.ok(content.startsWith('Title:'), 'should have taken the Readability path');
+  assert.ok(content.startsWith('Published: 2026-08-23T07:41:00-07:00\n'), content.slice(0, 200));
+  assert.match(content, /\n\nHere’s what people/, 'body starts with the page title after the header');
   assert.match(content, /Body paragraph 11/, 'article body must survive');
-  assert.doesNotMatch(content, /Watch \| Vision/, 'site nav must not be in the output');
+  assert.doesNotMatch(content, /Watch \| Vision/, '<nav> is still stripped');
+});
+
+test('a date that exists only in metadata reaches the output', () => {
+  // The other half of the comparison: the crude text cannot see a date that
+  // is never displayed. The header is what carries it.
+  const html = page({
+    head: '<script type="application/ld+json">{"@context":"https://schema.org","@type":"NewsArticle","datePublished":"2024-03-06T22:51:03.000Z"}</script>',
+  });
+  assert.match(extractHtml(html, URL).content, /^Published: 2024-03-06T22:51:03.000Z/);
+});
+
+test('HTML entities are decoded, once', () => {
+  const html = page({
+    body: `<p>Hampshire men&#x27;s coach &mdash; the club&#8217;s &quot;Hawks&quot; &amp; more; ` +
+      `literal &amp;#39; stays.</p>${bodyProse()}`,
+  });
+  const { content } = extractHtml(html, URL);
+  assert.match(content, /Hampshire men's coach — the club’s "Hawks" & more; literal &#39; stays\./);
+});
+
+test('HTML comments do not leak into the text', () => {
+  // Seen in the wild as "Sorry, you need to enable JavaScript ... -->": a
+  // comment containing markup is cut at its first ">" by the tag stripper.
+  const html = page({
+    body: `<!-- <div>Sorry, you need to enable JavaScript</div> -->${bodyProse()}`,
+  });
+  assert.doesNotMatch(extractHtml(html, URL).content, /enable JavaScript|-->/);
+});
+
+test('an over-long page spends the budget on the article, not the chrome', () => {
+  // Over MAX_CONTENT_CHARS the cut would land wherever it lands. A page whose
+  // chrome alone exceeds the cap would otherwise return no article at all.
+  const chrome = `<div class="sidebar">${'Related: another headline here. '.repeat(4000)}</div>`;
+  const html =
+    `<!doctype html><html><head><title>${HEADLINE}</title></head><body>${chrome}` +
+    `<article><h1>${HEADLINE}</h1>${bodyProse(12)}</article></body></html>`;
+
+  const { content } = extractHtml(html, URL);
+  assert.match(content, /Body paragraph 11/);
+  assert.doesNotMatch(content, /Related: another headline/);
 });
 
 // --- truncation ------------------------------------------------------------

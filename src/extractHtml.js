@@ -4,16 +4,13 @@ const { Readability, isProbablyReaderable } = require('@mozilla/readability');
 const { prepareMarkup, parseDocument, releaseDocument } = require('./parseDocument');
 const { MAX_CONTENT_CHARS } = require('./config');
 
-// Below this, Readability's output is short enough to be suspicious rather
-// than merely concise, and we compare it against the regex extraction (see
-// the under-selection guard in extractHtml).
+// The page's crude text is what we return, except when it is over
+// MAX_CONTENT_CHARS: then the cut would land wherever it lands, possibly
+// above the article, and Readability's article selection is used instead so
+// the budget goes on the article rather than on menus and comment threads.
+// Below this length its output is more likely a mis-selected fragment than an
+// article, and the crude text (cut at the cap) is kept instead.
 const MIN_READABILITY_CHARS = 500;
-
-// ...and it's only treated as under-selection if the crude extractor found
-// this many times more text. Readability legitimately returns far less than
-// regexExtract on every page — that's the point of it — so the guard has to
-// trigger on "a fragment instead of an article", not on "smaller".
-const UNDERSELECTION_RATIO = 5;
 
 // Class/id fragments that mark an element as publication metadata. The first
 // five mirror Readability's own REGEXPS.byline (Readability.js), because that
@@ -21,12 +18,18 @@ const UNDERSELECTION_RATIO = 5;
 // cover date-only containers it leaves in place but which we still want to
 // recognize when hunting for a <time> element.
 const DATE_CONTEXT_RE =
-  /byline|author|dateline|writtenby|p-author|post-date|entry-date|published|pubdate|timestamp/i;
+  /byline|author|dateline|writtenby|p-author|post-date|entry-date|published|pubdate|timestamp|submitted/i;
 
 // Elements that hold publication metadata on a typical news CMS — the same
 // nodes Readability strips from the article body. Matched in document order,
 // so an author-bio box at the foot of the article loses to the byline at the
 // top.
+//
+// `submitted` is Drupal's byline — "Submitted by <name> on <date>", in
+// `div.submitted` (D7) or `div.node__submitted` (D8+). Readability's byline
+// pattern doesn't know the name, so it is neither stripped as a byline nor
+// reliably kept: the div sits beside the body field, outside the container
+// Readability selects, and was being dropped with the rest of the chrome.
 const BYLINE_SELECTOR = [
   '[rel~="author" i]',
   '[itemprop~="author" i]',
@@ -37,6 +40,7 @@ const BYLINE_SELECTOR = [
   '[class*="entry-date" i]',
   '[class*="published" i]',
   '[class*="timestamp" i]',
+  '[class*="submitted" i]',
   '[id*="byline" i]',
   '[id*="author" i]',
 ].join(',');
@@ -67,22 +71,71 @@ const PUBLISHED_META_SELECTORS = [
   'meta[name="dcterms.issued" i]',
 ].join(',');
 
-// Same crude strip-and-collapse approach as the reference Worker's
-// extractText(): used as a fallback for pages Readability can't parse (JS-only
-// shells, malformed markup, non-article pages) rather than as the primary
-// method — Node lets us do much better than regex-stripping via jsdom.
+// The same facts expressed as RDFa or microdata on *any* element, not just
+// <meta>. Readability's metadata pass reads <meta> tags only, so these are
+// invisible to it — and they are how Drupal publishes its dates, e.g.
+//
+//   <span property="dc:date dc:created" content="2010-08-24T22:41:00-04:00">
+//
+// Drupal records creation, not publication, but for a CMS node the two are
+// the same moment. Modification properties (dc:modified, schema:dateModified)
+// are absent for the reason given above.
+const PUBLISHED_ATTR_SELECTORS = [
+  '[property~="dc:date" i][content]',
+  '[property~="dc:created" i][content]',
+  '[property~="dc:issued" i][content]',
+  '[property~="dcterms:created" i][content]',
+  '[property~="dcterms:issued" i][content]',
+  '[property~="schema:datePublished" i][content]',
+  '[property~="schema:dateCreated" i][content]',
+  '[itemprop~="datePublished" i][content]',
+  '[itemprop~="datePublished" i][datetime]',
+].join(',');
+
+// Named entities worth decoding. Numeric references (&#8217; &#x27;) are
+// decoded generically; these are the named ones common in real pages. An
+// entity not listed here is left as written rather than guessed at.
+const NAMED_ENTITIES = {
+  amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ',
+  lsquo: '\u2018', rsquo: '\u2019', ldquo: '\u201C', rdquo: '\u201D',
+  sbquo: '\u201A', bdquo: '\u201E', laquo: '\u00AB', raquo: '\u00BB',
+  ndash: '\u2013', mdash: '\u2014', hellip: '\u2026', middot: '\u00B7',
+  bull: '\u2022', copy: '\u00A9', reg: '\u00AE', trade: '\u2122',
+  deg: '\u00B0', eacute: '\u00E9', shy: '',
+};
+
+// One pass, so `&amp;#39;` decodes to the literal text `&#39;` — as written on
+// the page — rather than being decoded twice into an apostrophe.
+function decodeEntities(text) {
+  return text.replace(/&(#\d+|#x[0-9a-f]+|[a-z]+);/gi, (match, ref) => {
+    if (ref[0] === '#') {
+      const code = ref[1] === 'x' || ref[1] === 'X'
+        ? parseInt(ref.slice(2), 16)
+        : parseInt(ref.slice(1), 10);
+      return code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : match;
+    }
+    const named = Object.hasOwn(NAMED_ENTITIES, ref) ? NAMED_ENTITIES[ref] : undefined;
+    return named === undefined ? match : named;
+  });
+}
+
+// The page's visible text, nearly whole — the reference Worker's approach.
+// This is the primary extraction, not a fallback: it keeps the bylines,
+// datelines, captions and info panels that an article extractor discards as
+// chrome, and those are where a claim's date or headline figure often lives.
+// The model reading the result copes with the leftover navigation far better
+// than with a missing fact. See "Extraction" in the README for the benchmark
+// comparison this rests on.
 function regexExtract(html) {
-  return html
-    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-    .replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, '')
-    .replace(/<header[^>]*>[\s\S]*?<\/header>/gi, '')
-    .replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
+  return decodeEntities(
+    html
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, ' ')
+      .replace(/<header[^>]*>[\s\S]*?<\/header>/gi, ' ')
+      .replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, ' ')
+      .replace(/<[^>]+>/g, ' ')
+  )
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -140,6 +193,11 @@ function findPublishedTime(doc) {
     return metaContent.trim();
   }
 
+  for (const node of doc.querySelectorAll(PUBLISHED_ATTR_SELECTORS)) {
+    const value = (node.getAttribute('content') || node.getAttribute('datetime') || '').trim();
+    if (value) return value;
+  }
+
   for (const time of doc.querySelectorAll('time[datetime]')) {
     const datetime = time.getAttribute('datetime').trim();
     if (!datetime) continue;
@@ -165,24 +223,17 @@ function preferFullByline(captured, readabilityByline) {
   return captured.includes(readabilityByline) ? captured : readabilityByline;
 }
 
-// Re-attaches the three things Readability computes and then drops on the
-// floor, because `article.textContent` is the article *body* only:
+// The publication metadata a page carries but may not display. The body is
+// the page's visible text, so a date shown in a byline is already in it; this
+// header covers the dates that exist only in metadata (JSON-LD, <meta>, RDFa),
+// which the crude text cannot see, and bylines inside a <header> element,
+// which it strips along with the site banner.
 //
-//   - the <h1> headline, removed as a duplicate of the document title;
-//   - the byline, removed from the body by _grabArticle and parked in
-//     `article.byline` — and on most news CMSes the publication date is in
-//     that same element, so removing the byline removes the date;
-//   - `article.publishedTime`, parsed out of metadata and never used.
-//
-// A missing date is not a cosmetic loss for this service's one caller: a
-// claim like "the impressions appeared in August 2026" is unverifiable
-// against a source whose date has been stripped, and the model reports that
-// as the citation failing rather than as the fetcher failing.
+// No Title line: the page's <title> is already the first text of the body.
 //
 // The header goes at the front so it survives MAX_CONTENT_CHARS truncation.
-function buildHeader({ title, byline, publishedTime, siteName }) {
+function buildHeader({ byline, publishedTime, siteName }) {
   const lines = [
-    ['Title', title],
     ['Published', publishedTime],
     ['By', byline],
     ['Site', siteName],
@@ -193,16 +244,16 @@ function buildHeader({ title, byline, publishedTime, siteName }) {
   return lines.length > 0 ? `${lines.join('\n')}\n\n` : '';
 }
 
-// Extracts readable text from an HTML document. Tries Readability (a real
-// article-extraction pass: strips nav/ads/boilerplate far better than regex)
-// and falls back to the Worker's original tag-stripping approach when
-// Readability can't find an article (JS-only shells, non-article pages, feed
-// pages, etc.) so those cases degrade gracefully instead of returning nothing.
+// Extracts text from an HTML document: the page's crude text (regexExtract),
+// preceded by a publication-metadata header when Readability can read one.
+//
+// Readability's own article text is used only when the crude text would not
+// fit under MAX_CONTENT_CHARS — see MIN_READABILITY_CHARS.
 //
 // Returns { content, truncated, bodyChars }. `bodyChars` is the length of the
 // extracted body *excluding* the metadata header — callers deciding whether a
 // page yielded usable content must use it, since a cookie wall with a fat
-// <title> and byline can clear a content floor on header text alone.
+// byline can clear a content floor on header text alone.
 function extractHtml(html, url) {
   // Bound the input before either extraction path touches it. Building a DOM
   // costs ~130 MB of heap per MB of markup and the regex chain is no cheaper,
@@ -227,10 +278,9 @@ function extractHtml(html, url) {
       const publishedHint = findPublishedTime(doc);
 
       const article = new Readability(doc).parse();
-      if (article && article.textContent) {
-        readabilityText = article.textContent.replace(/\s+/g, ' ').trim();
+      if (article) {
+        readabilityText = (article.textContent || '').replace(/\s+/g, ' ').trim();
         header = buildHeader({
-          title: article.title,
           byline: preferFullByline(bylineText, article.byline),
           // Readability reads publication metadata, but not all of it; fall
           // back to the tags and byline-scoped <time> elements it skips.
@@ -241,7 +291,8 @@ function extractHtml(html, url) {
     }
   } catch {
     // jsdom/Readability choked on this document (malformed HTML, unsupported
-    // constructs) — fall through to the regex extractor below.
+    // constructs). The crude text below needs neither; only the header and
+    // the over-cap article selection are lost.
     readabilityText = '';
     header = '';
   } finally {
@@ -254,32 +305,12 @@ function extractHtml(html, url) {
     releaseDocument(doc);
   }
 
-  // Under-selection guard. The existing fallback only fires when Readability
-  // returns *nothing*; a run that picks the wrong container and returns a
-  // sliver of a related-posts widget clears MIN_CONTENT_CHARS and ships as
-  // the source, which is worse than the crude extraction it replaced because
-  // it is confidently, silently wrong. Not a failure mode observed in the
-  // wild — the fallback is cheap and the downside it covers is not.
-  let body = readabilityText;
-  let usedFallback = false;
-
-  if (body.length === 0) {
-    // Readability found no article at all — the original unconditional
-    // fallback, unchanged: whatever the regex yields is what we have.
-    body = regexExtract(markup);
-    usedFallback = true;
-  } else if (body.length < MIN_READABILITY_CHARS) {
-    const regexText = regexExtract(markup);
-    if (regexText.length >= Math.max(body.length * UNDERSELECTION_RATIO, MIN_READABILITY_CHARS)) {
-      body = regexText;
-      usedFallback = true;
-    }
-  }
-
-  if (usedFallback) {
-    // The header describes the Readability parse, not this text, and the
-    // regex output already carries whatever byline/date the page showed.
-    header = '';
+  let body = regexExtract(markup);
+  if (
+    header.length + body.length > MAX_CONTENT_CHARS &&
+    readabilityText.length >= MIN_READABILITY_CHARS
+  ) {
+    body = readabilityText;
   }
 
   const { content, truncated } = truncate(`${header}${body}`);
