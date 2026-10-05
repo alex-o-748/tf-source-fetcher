@@ -7,6 +7,7 @@ const cache = require('./src/cache');
 const { isAllowedByRobots, robotsCacheStats } = require('./src/robots');
 const { HostRateLimiter, RateLimitedError } = require('./src/rateLimiter');
 const { fetchAndExtract } = require('./src/fetchTarget');
+const { isCacheableNetworkError } = require('./src/networkError');
 const metrics = require('./src/metrics');
 
 const hostLimiter = new HostRateLimiter();
@@ -111,10 +112,23 @@ async function handleFetch(targetUrl, pageParamRaw, res, signal) {
   const result = await fetchAndExtract(targetUrl, pageParamRaw, { signal });
 
   if (result.networkError) {
-    // Never reached upstream at all — status stays null per contract, and
-    // this is transient by nature so it's never cached.
+    // Never reached upstream at all — status stays null per contract.
+    // `errorCode` is why (ENOTFOUND, ECONNREFUSED, a certificate error...),
+    // so a caller can skip retrying a failure that will reproduce. Most of
+    // these are transient and never cached; the ones that describe the
+    // publisher's own DNS/TLS setup are cached like a 404 — see
+    // src/networkError.js.
+    const body = {
+      ...emptyContract(null, null),
+      error: result.error,
+      errorCode: result.errorCode ?? null,
+      cached: false,
+    };
+    if (pageIsValidInt && isCacheableNetworkError(result.errorCode)) {
+      await cache.set(targetUrl, cacheKeyPage, { ...body, cached: undefined }, cache.CACHE_TTL_ERROR_SECONDS);
+    }
     metrics.record({ networkError: true });
-    sendJson(res, 502, { ...emptyContract(null, null), error: result.error, cached: false });
+    sendJson(res, 502, body);
     return;
   }
 
