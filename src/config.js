@@ -86,11 +86,22 @@ module.exports = {
   // exists and when to delete it.
   MEM_LOG_EVERY: Number(process.env.MEM_LOG_EVERY ?? 50),
 
-  // Cache (Redis). Toolforge's shared Redis instance is documented as
-  // reachable at tools-redis:6379 from any tool's containers; namespaced by
-  // key prefix below so tools sharing the instance don't collide.
-  REDIS_URL: process.env.REDIS_URL || 'redis://tools-redis:6379',
-  CACHE_KEY_PREFIX: 'source-fetcher:',
+  // Cache (Redis). Toolforge's shared instance, at the address
+  // https://wikitech.wikimedia.org/wiki/Help:Toolforge/Redis gives for it
+  // (checked 2026-10-05). The default used to be `tools-redis:6379`, which
+  // that page does not list. An unreachable Redis, like DISABLE_CACHE=1 below,
+  // means running without a cache, announced once at startup and invisible
+  // afterwards — the live service ran that way unnoticed until 2026-10-05.
+  // GET /metrics now reports the cache's state (src/cache.js status()).
+  REDIS_URL: process.env.REDIS_URL || 'redis://redis.svc.tools.eqiad1.wikimedia.cloud:6379',
+  // The shared instance has no access control: any tool can read or write any
+  // key it can name. A guessable prefix would let another tool plant text
+  // under a source URL's key, and this service would serve it as that
+  // source's content. Set a random one in production, as the page above
+  // recommends (KEYS and SCAN are disabled there, so it can't be listed):
+  //   toolforge envvars create CACHE_KEY_PREFIX "source-fetcher:$(openssl rand -hex 16):"
+  // Changing it starts the cache empty; nothing else is lost.
+  CACHE_KEY_PREFIX: process.env.CACHE_KEY_PREFIX || 'source-fetcher:',
   CACHE_TTL_OK_SECONDS: Number(process.env.CACHE_TTL_OK_SECONDS) || 24 * 60 * 60,
   CACHE_TTL_ERROR_SECONDS: Number(process.env.CACHE_TTL_ERROR_SECONDS) || 60 * 60,
   // Disable caching entirely (e.g. for local dev without Redis) by setting

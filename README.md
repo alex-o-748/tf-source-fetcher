@@ -32,7 +32,8 @@ GET /?fetch=<url-encoded target URL>&page=<optional 1-based page number>
 `page` only applies to paginated PDFs; most callers won't send it.
 
 There is also `GET /metrics`, which returns process counters and memory as
-JSON. It is temporary diagnostic scaffolding, not part of the contract — see
+JSON, plus `"cache"`: `ready`, `unavailable` (Redis not reachable — every
+response will say `cached: false`) or `disabled`. It is temporary diagnostic scaffolding, not part of the contract — see
 [the instrumentation](#the-instrumentation-temporary). It reports counts and
 memory only: no URLs, no fetched content, nothing a caller supplied.
 
@@ -604,7 +605,8 @@ All via environment variables (Toolforge envvars, never committed files):
 | Variable | Default | Purpose |
 |---|---|---|
 | `PORT` | *(set by Toolforge)* | listen port |
-| `REDIS_URL` | `redis://tools-redis:6379` | Toolforge's shared Redis instance |
+| `REDIS_URL` | `redis://redis.svc.tools.eqiad1.wikimedia.cloud:6379` | Toolforge's shared Redis instance ([Help:Toolforge/Redis](https://wikitech.wikimedia.org/wiki/Help:Toolforge/Redis)). The old default, `tools-redis:6379`, is not on that page. `GET /metrics` reports `"cache"` so a cache-less service is visible |
+| `CACHE_KEY_PREFIX` | `source-fetcher:` | prefix on every cache key. **Set a random one in production**: the shared Redis has no access control, so a guessable prefix lets another tool plant text under a source URL's key. `toolforge envvars create CACHE_KEY_PREFIX "source-fetcher:$(openssl rand -hex 16):"` |
 | `DISABLE_CACHE` | unset | set to `1` to run without a cache |
 | `FETCH_TIMEOUT_MS` | `20000` | upstream fetch timeout (connect + body read) |
 | `MAX_HTML_BYTES` | `20971520` (20 MB) | HTML **download** size guard |

@@ -30,10 +30,16 @@ async function connect() {
       console.warn('[cache] redis error, caching temporarily degraded:', err.message);
     }
   });
+  // ioredis keeps reconnecting after a failed first attempt. Without this, a
+  // Redis that was briefly unreachable when the pod started left the cache
+  // off for the life of the process, with nothing but the one startup line
+  // to say so.
+  client.on('ready', () => {
+    if (!ready) console.log(`[cache] connected to Redis at ${REDIS_URL}`);
+    ready = true;
+  });
   try {
     await client.connect();
-    ready = true;
-    console.log(`[cache] connected to Redis at ${REDIS_URL}`);
   } catch (err) {
     console.warn(
       `[cache] could not connect to Redis at ${REDIS_URL} (${err.message}); running without a cache`
@@ -84,11 +90,20 @@ async function disconnect() {
   ready = false;
 }
 
+// For GET /metrics: whether this process is caching at all. The cache being
+// silently off is invisible from outside otherwise — every response just says
+// `cached: false`.
+function status() {
+  if (CACHE_DISABLED) return 'disabled';
+  return ready ? 'ready' : 'unavailable';
+}
+
 module.exports = {
   connect,
   disconnect,
   get,
   set,
+  status,
   isReady: () => ready,
   CACHE_TTL_OK_SECONDS,
   CACHE_TTL_ERROR_SECONDS,
