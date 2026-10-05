@@ -202,7 +202,7 @@ const server = http.createServer((req, res) => {
   // process memory only; no URLs, no fetched content, nothing a caller told
   // us. Remove with the rest of the instrumentation once the leak is found.
   if (url.pathname === '/metrics') {
-    sendJson(res, 200, metrics.snapshot());
+    sendJson(res, 200, { ...metrics.snapshot(), cache: cache.status() });
     return;
   }
 

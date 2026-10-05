@@ -194,6 +194,12 @@ test('PDF extraction: out-of-range page is a 400 with totalPages', async () => {
   assert.ok(/Invalid page number/.test(body.error));
 });
 
+test('GET /metrics says whether the cache is on', async () => {
+  const res = await fetch(`${BASE}/metrics`);
+  const body = await res.json();
+  assert.equal(body.cache, 'ready');
+});
+
 test('missing fetch param is a 400', async () => {
   const res = await fetch(`${BASE}/`);
   assert.equal(res.status, 400);
