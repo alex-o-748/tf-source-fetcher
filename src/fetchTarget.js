@@ -1,6 +1,7 @@
 'use strict';
 
 const { extractHtml } = require('./extractHtml');
+const { decodeHtml } = require('./charset');
 const { extractPdf, InvalidPageError } = require('./extractPdf');
 const { networkErrorCode } = require('./networkError');
 const {
@@ -181,7 +182,10 @@ async function fetchAndExtract(targetUrl, pageParam, { signal } = {}) {
       };
     }
 
-    const html = buf.toString('utf8');
+    // Not buf.toString('utf8'): a Windows-1251 or KOI8-R page decoded as
+    // UTF-8 is a wall of U+FFFD that still clears MIN_CONTENT_CHARS. See
+    // src/charset.js.
+    const { text: html } = decodeHtml(buf, contentType);
     const extracted = extractHtml(html, targetUrl);
 
     // bodyChars, not content.length: content carries a Title/Published/By
