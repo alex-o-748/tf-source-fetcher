@@ -142,8 +142,15 @@ status if that field is missing, so either way is safe to depend on.
   [`@mozilla/readability`](https://github.com/mozilla/readability)'s article
   selection for pages too long to return whole — see [Extraction](#extraction).
 - PDF extraction uses [`unpdf`](https://github.com/unjs/unpdf), the same
-  library the Worker uses, including per-page extraction when `page` is
-  given. Every PDF document is explicitly cleaned up and its loading task is
+  library the Worker uses. When `page` is given, only that page's text is
+  returned, read directly from PDF.js (`getPage(n).getTextContent()`), then
+  whitespace-collapsed and truncated like a whole-document extraction.
+  **Before this fix, `page` was silently ignored:** the code passed
+  `{ pages: [n] }` to unpdf's `extractText()`, which has no such option and
+  always extracts every page, so a `page=N` request got the document from
+  page 1 up to the 100,000-character cap while the response still said
+  `"page": N`. `test/extractPdf.test.js` now checks the page text against a
+  bundled three-page PDF (`test/fixtures/three-pages.pdf`). Every PDF document is explicitly cleaned up and its loading task is
   destroyed after success, invalid-page errors, parser errors, timeouts, and
   client disconnects; this releases PDF.js page/operator/font caches and
   worker resources.

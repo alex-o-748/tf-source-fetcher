@@ -41,11 +41,6 @@ class InvalidPageError extends Error {
   }
 }
 
-// Extracts text from a PDF buffer. When `pageParam` (1-based) is given, only
-// that page is extracted; otherwise the whole document is extracted and
-// truncated per MAX_CONTENT_CHARS (large PDFs fetched without a page param
-// rely on the `truncated` flag, per the client's own "large PDF without page"
-// warning behavior).
 const destructionTasks = new WeakMap();
 
 function destroyPdf(pdf) {
@@ -71,6 +66,23 @@ function destroyPdf(pdf) {
   return task;
 }
 
+// Text of one 1-based page, built the way unpdf builds each page's text:
+// item strings concatenated, with a newline wherever PDF.js marks an end of
+// line.
+async function extractPageText(pdf, pageNum) {
+  const pdfPage = await pdf.getPage(pageNum);
+  const { items } = await pdfPage.getTextContent();
+  return items
+    .filter((item) => typeof item.str === 'string')
+    .map((item) => item.str + (item.hasEOL ? '\n' : ''))
+    .join('');
+}
+
+// Extracts text from a PDF buffer. When `pageParam` (1-based) is given, only
+// that page is extracted; otherwise the whole document is extracted. Either
+// way the text is whitespace-collapsed and truncated per MAX_CONTENT_CHARS
+// (large PDFs fetched without a page param rely on the `truncated` flag, per
+// the client's own "large PDF without page" warning behavior).
 async function extractPdf(buf, pageParam, { signal } = {}) {
   let pdf;
   let abortCleanup;
@@ -90,18 +102,23 @@ async function extractPdf(buf, pageParam, { signal } = {}) {
 
     const totalPages = pdf.numPages;
 
-    let pages;
     let page = null;
     if (pageParam !== undefined && pageParam !== null) {
       const pageNum = parseInt(pageParam, 10);
       if (!Number.isInteger(pageNum) || pageNum < 1 || pageNum > totalPages) {
         throw new InvalidPageError(totalPages);
       }
-      pages = [pageNum];
       page = pageNum;
     }
 
-    const { text } = await extractPdfText(pdf, { mergePages: true, pages });
+    // unpdf's extractText() has no page selector: it only reads `mergePages`
+    // and always walks every page, so passing `{ pages: [n] }` used to be
+    // silently ignored and a `page=N` request got the whole document from
+    // page 1 (up to the truncation cap) labelled as page N. Read the one
+    // requested page straight from PDF.js instead.
+    const text = page === null
+      ? (await extractPdfText(pdf, { mergePages: true })).text
+      : await extractPageText(pdf, page);
     const normalized = text.replace(/\s+/g, ' ').trim();
     const { content, truncated } = truncate(normalized);
 

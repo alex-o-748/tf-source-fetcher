@@ -185,6 +185,12 @@ test('PDF extraction: single page via page param', async () => {
   assert.equal(body.pdf, true);
   assert.equal(body.page, 3);
   assert.equal(body.totalPages, 10);
+  // The page param must change the content, not just the label: it was once
+  // silently ignored and page 3 came back as the whole document.
+  const { body: whole } = await callFetch(`${FIXTURES_BASE}/doc.pdf`);
+  assert.ok(body.content.length > 0);
+  assert.ok(body.content.length < whole.content.length);
+  assert.ok(whole.content.includes(body.content.slice(0, 40)));
 });
 
 test('PDF extraction: out-of-range page is a 400 with totalPages', async () => {
