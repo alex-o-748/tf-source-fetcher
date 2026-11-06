@@ -9,6 +9,12 @@ const {
   CACHE_DISABLED,
 } = require('./config');
 
+// Bumped whenever what a fetch returns for the same URL changes, so a deploy
+// stops serving entries extracted by the old code instead of waiting out
+// their TTL. v2: pages are decoded in their declared charset (src/charset.js);
+// v1 entries for non-UTF-8 pages are U+FFFD noise.
+const CONTENT_VERSION = 'v2';
+
 let client = null;
 let ready = false;
 
@@ -60,7 +66,7 @@ function normalizeKey(targetUrl, page) {
   } catch {
     normalized = targetUrl;
   }
-  return `${CACHE_KEY_PREFIX}${normalized}${page ? `#page=${page}` : ''}`;
+  return `${CACHE_KEY_PREFIX}${CONTENT_VERSION}:${normalized}${page ? `#page=${page}` : ''}`;
 }
 
 async function get(targetUrl, page) {

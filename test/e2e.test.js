@@ -90,6 +90,13 @@ test('same URL is served from cache on subsequent hits', async () => {
   assert.equal(second.body.content, first.body.content);
 });
 
+test('Windows-1251 page declared only in <meta> is decoded, not turned into U+FFFD', async () => {
+  const { httpStatus, body } = await callFetch(`${FIXTURES_BASE}/cp1251-meta`);
+  assert.equal(httpStatus, 200);
+  assert.ok(body.content.includes('Евреям, покинувшим Россию, было запрещено возвращаться обратно'));
+  assert.ok(!body.content.includes('\uFFFD'));
+});
+
 test('too-short content: no-content error, content null', async () => {
   const { httpStatus, body } = await callFetch(`${FIXTURES_BASE}/short`);
   assert.equal(httpStatus, 200);

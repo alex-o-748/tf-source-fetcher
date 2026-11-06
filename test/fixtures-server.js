@@ -19,6 +19,24 @@ function longArticleHtml() {
 </body></html>`;
 }
 
+// Encodes a string in a single-byte legacy charset, by inverting Node's own
+// decoder table. Node has no TextEncoder for anything but UTF-8.
+function encodeSingleByte(text, label) {
+  const decoder = new TextDecoder(label);
+  const table = new Map();
+  for (let b = 0; b < 256; b++) table.set(decoder.decode(Uint8Array.of(b)), b);
+  return Buffer.from([...text].map((ch) => table.get(ch) ?? 0x3f));
+}
+
+// A 2000s-era Russian page as the Wayback Machine's raw id_ endpoint serves
+// it: Windows-1251 bytes, declared only by a <meta> tag, and a Content-Type
+// header with no charset at all.
+function cp1251ArticleHtml() {
+  const para = 'Евреям, покинувшим Россию, было запрещено возвращаться обратно. ';
+  return `<html><head><meta http-equiv="Content-Type" content="text/html; charset=windows-1251">
+<title>От редактора</title></head><body><p>${para.repeat(40)}</p></body></html>`;
+}
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://localhost');
 
@@ -30,6 +48,11 @@ const server = http.createServer((req, res) => {
   if (url.pathname === '/article') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     res.end(longArticleHtml());
+    return;
+  }
+  if (url.pathname === '/cp1251-meta') {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(encodeSingleByte(cp1251ArticleHtml(), 'windows-1251'));
     return;
   }
   if (url.pathname === '/short') {
