@@ -3,6 +3,7 @@
 const { Readability, isProbablyReaderable } = require('@mozilla/readability');
 const { prepareMarkup, parseDocument, releaseDocument } = require('./parseDocument');
 const { MAX_CONTENT_CHARS } = require('./config');
+const { keepRatingLabels } = require('./ratingLabels');
 
 // The page's crude text is what we return, except when it is over
 // MAX_CONTENT_CHARS: then the cut would land wherever it lands, possibly
@@ -126,11 +127,16 @@ function decodeEntities(text) {
 // The model reading the result copes with the leftover navigation far better
 // than with a missing fact. See "Extraction" in the README for the benchmark
 // comparison this rests on.
+//
+// keepRatingLabels writes a rating graphic's aria-label/alt ("3 out of 5
+// stars") into the text, which tag stripping would otherwise drop. Only this
+// path does: Readability's article text, used for over-cap pages, keeps no
+// attributes.
 function regexExtract(html) {
   return decodeEntities(
-    html
+    keepRatingLabels(html
       .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
-      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' '))
       .replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, ' ')
       .replace(/<header[^>]*>[\s\S]*?<\/header>/gi, ' ')
       .replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, ' ')

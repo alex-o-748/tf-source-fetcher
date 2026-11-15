@@ -478,6 +478,11 @@ would not fit under `MAX_CONTENT_CHARS` (100,000) — there its article
 selection decides where the budget goes, instead of the cut landing wherever
 it lands.
 
+A rating drawn as a graphic, such as the Guardian's stars, has its score only
+in an `aria-label` or `<img alt>`. The crude text writes that label in place
+when it reads as a rating ("3 out of 5 stars", "4/5"), and leaves other alt
+text out (`src/ratingLabels.js`, the same rule as the Worker's).
+
 ### Why not return Readability's article text
 
 This service used to. Readability is a reader view: it keeps the block it
